@@ -2,6 +2,7 @@
 
 #include "vulkan2.h"
 #include "instance.h"
+#include "hooking/layer.h"
 #include "utils/vulkan_utils.h"
 #include "shader.h"
 #include "shader_spirv.h"
@@ -82,6 +83,12 @@ static uint32_t FindQueueFamily(PFN_vkGetPhysicalDeviceQueueFamilyProperties get
 }
 
 RND_Vulkan2::RND_Vulkan2(XrInstance xrInstance, XrSystemId systemId) {
+    // SteamVR creates extra internal VkInstances/VkDevices on this thread (in xrCreateVulkanInstanceKHR and
+    // xrGetVulkanGraphicsDevice2KHR) with its own VkApplicationInfo; they must all bypass the layer like Device B.
+    struct DeviceBCreationScope {
+        DeviceBCreationScope() { VRLayer::g_creatingDeviceB = true; }
+        ~DeviceBCreationScope() { VRLayer::g_creatingDeviceB = false; }
+    } deviceBCreationScope;
     // pch.h's VK_NO_PROTOTYPES means "vkGetInstanceProcAddr" isn't a declared,
     // linkable symbol here - fetch the real one via dlopen/dlsym instead. Deliberately
     // not linking this layer .so against -lvulkan directly and calling functions
@@ -153,7 +160,9 @@ RND_Vulkan2::RND_Vulkan2(XrInstance xrInstance, XrSystemId systemId) {
     xrVkInstInfo.pfnGetInstanceProcAddr = realGetInstanceProcAddr;
     xrVkInstInfo.vulkanCreateInfo = &instInfo;
     VkResult vkInstResult = VK_SUCCESS;
-    checkXRResult(xrCreateVulkanInstanceKHR_(xrInstance, &xrVkInstInfo, &m_instance, &vkInstResult), "xrCreateVulkanInstanceKHR failed!");
+    XrResult xrInstResult = xrCreateVulkanInstanceKHR_(xrInstance, &xrVkInstInfo, &m_instance, &vkInstResult);
+    checkXRResult(xrInstResult, "xrCreateVulkanInstanceKHR failed!");
+    VRLayer::SetDeviceBHandles(m_instance, VK_NULL_HANDLE);
     checkVkResult(vkInstResult, "xrCreateVulkanInstanceKHR's inner vkCreateInstance failed!");
 
     // m_instance was created via xrCreateVulkanInstanceKHR above, so (unlike passing
@@ -213,7 +222,9 @@ RND_Vulkan2::RND_Vulkan2(XrInstance xrInstance, XrSystemId systemId) {
     xrVkDevInfo.vulkanPhysicalDevice = m_physicalDevice;
     xrVkDevInfo.vulkanCreateInfo = &devInfo;
     VkResult vkDevResult = VK_SUCCESS;
-    checkXRResult(xrCreateVulkanDeviceKHR_(xrInstance, &xrVkDevInfo, &m_device, &vkDevResult), "xrCreateVulkanDeviceKHR failed!");
+    XrResult xrDevResult = xrCreateVulkanDeviceKHR_(xrInstance, &xrVkDevInfo, &m_device, &vkDevResult);
+    checkXRResult(xrDevResult, "xrCreateVulkanDeviceKHR failed!");
+    VRLayer::SetDeviceBHandles(VK_NULL_HANDLE, m_device);
     checkVkResult(vkDevResult, "xrCreateVulkanDeviceKHR's inner vkCreateDevice failed!");
 
     m_functions.Load(realGetInstanceProcAddr, m_instance, m_device);

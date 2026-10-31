@@ -1232,6 +1232,23 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
 
     // calculate new hold, trigger and release
     uint32_t combinedHold = (vpadStatus.hold.getLE() | (newXRBtnHold | newXRStickHold));
+#ifndef _WIN32
+    // headless testing aids (Steam Frame branch): BETTERVR_DEBUG_AUTOPRESS_A=1 taps A (200ms every 2s) while in menus,
+    // to get past the title screen and load the save without anyone wearing the headset; BETTERVR_LINUX_BENCH_DIAG=1
+    // logs the in-game state once a second so scripts can tell when gameplay starts
+    if (!gameState.in_game && std::getenv("BETTERVR_DEBUG_AUTOPRESS_A")) {
+        const auto phase = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() % 2000;
+        if (phase < 200)
+            combinedHold |= VPAD_BUTTON_A;
+    }
+    if (std::getenv("BETTERVR_LINUX_BENCH_DIAG")) {
+        static auto s_lastDiag = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - s_lastDiag > std::chrono::seconds(1)) {
+            s_lastDiag = std::chrono::steady_clock::now();
+            Log::print<INFO>("[BenchDiag] inMenu={}", !gameState.in_game);
+        }
+    }
+#endif
     vpadStatus.hold = combinedHold;
     vpadStatus.trig = (combinedHold & ~oldCombinedHold);
     vpadStatus.release = (~combinedHold & oldCombinedHold);

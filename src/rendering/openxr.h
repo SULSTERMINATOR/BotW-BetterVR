@@ -1,5 +1,24 @@
 #pragma once
 
+#include <mutex>
+
+// Mutex-guarded value with the load()/store() subset of std::atomic. GCC 13's std::atomic<T> for
+// large structs zeroed fields on store on aarch64 (hand pose y always read back as 0), so the big
+// input/game state structs use this instead.
+template <typename T>
+class LockedValue {
+public:
+    LockedValue() = default;
+    LockedValue(const T& value) : m_value(value) {}
+    T load() const { std::lock_guard lock(m_mutex); return m_value; }
+    void store(const T& value) { std::lock_guard lock(m_mutex); m_value = value; }
+    template <typename F>
+    void update(F&& fn) { std::lock_guard lock(m_mutex); fn(m_value); }
+private:
+    mutable std::mutex m_mutex;
+    T m_value{};
+};
+
 #include "hooking/rumble.h"
 #include "utils/controller_bindings.h"
 
@@ -41,6 +60,7 @@ public:
         bool supportsPicoUltraController;
         bool supportsCosmosController;
         bool supportsHPMixedRealityController;
+        bool supportsFrameController; // Steam Frame (XR_VALVE_frame_controller_interaction)
         ControllerType activeControllerType = ControllerType::Unknown;
     } m_capabilities = {};
 
@@ -127,7 +147,7 @@ public:
             XrActionStateBoolean rightTrigger;
         } inMenu;
     };
-    std::atomic<InputState> m_input = InputState{};
+    LockedValue<InputState> m_input = InputState{};
     std::atomic<glm::fquat> m_inputCameraRotation = glm::identity<glm::fquat>();
     std::atomic_int32_t m_pendingSnapTurnDirection = 0;
     std::atomic_uint64_t m_pendingSnapTurnRequestUntilNs = 0;
@@ -186,7 +206,7 @@ public:
         int magnesis_forward_frames_interval = 0;
         bool trigger_pressed_over_body_slot = false;
     };
-    std::atomic<GameState> m_gameState{};
+    LockedValue<GameState> m_gameState{};
     std::atomic_bool m_isMenuOpen = false;
     std::atomic_uint8_t m_currMenuTab = 0;
 

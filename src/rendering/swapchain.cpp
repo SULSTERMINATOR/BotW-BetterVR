@@ -17,21 +17,31 @@ Swapchain<T>::Swapchain(uint32_t width, uint32_t height, uint32_t sampleCount): 
         return (VkFormat)*found;
     };
 
-    const std::vector<VkFormat> preferredColorFormats = {
-        // fixme: check if OpenXR prefers sRGB or not
-        T
-    };
-    m_format = getBestSwapchainFormat(preferredColorFormats);
+    // SteamVR (Steam Frame) only offers sRGB colour swapchains. Fall back to the sRGB twin of T with a mutable format,
+    // and keep rendering through a T (UNORM) view, so the same bytes reach the compositor as on runtimes offering T.
+    std::vector<VkFormat> preferredColorFormats = { T };
+    if constexpr (T == VK_FORMAT_R8G8B8A8_UNORM) {
+        preferredColorFormats.push_back(VK_FORMAT_R8G8B8A8_SRGB);
+    }
+    VkFormat xrFormat = getBestSwapchainFormat(preferredColorFormats);
+    m_format = T;
+    bool mutableFormat = xrFormat != T;
+    if (mutableFormat) {
+        Log::print<INFO>("OpenXR runtime lacks swapchain format {}, using {} with a {} view", (int)T, (int)xrFormat, (int)T);
+    }
 
     XrSwapchainCreateInfo swapchainCreateInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
     swapchainCreateInfo.width = width;
     swapchainCreateInfo.height = height;
     swapchainCreateInfo.arraySize = 1;
     swapchainCreateInfo.sampleCount = sampleCount;
-    swapchainCreateInfo.format = m_format;
+    swapchainCreateInfo.format = xrFormat;
     swapchainCreateInfo.mipCount = 1;
     swapchainCreateInfo.faceCount = 1;
     swapchainCreateInfo.usageFlags = (VulkanUtils::IsDepthFormat(T) ? XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    if (mutableFormat) {
+        swapchainCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+    }
     swapchainCreateInfo.createFlags = 0;
     checkXRResult(xrCreateSwapchain(VRManager::instance().XR->GetSession(), &swapchainCreateInfo, &m_swapchain), "Failed to create OpenXR swapchain images!");
 

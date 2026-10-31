@@ -70,6 +70,9 @@ OpenXR::OpenXR() {
         else if (strcmp(extensionProperties.extensionName, XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME) == 0) {
             m_capabilities.supportsHPMixedRealityController = true;
         }
+        else if (strcmp(extensionProperties.extensionName, "XR_VALVE_frame_controller_interaction") == 0) {
+            m_capabilities.supportsFrameController = true;
+        }
     }
 
     if (!vulkanSupported) {
@@ -95,6 +98,7 @@ OpenXR::OpenXR() {
     if (m_capabilities.supportsPicoUltraController) enabledExtensions.emplace_back(XR_BD_ULTRA_CONTROLLER_INTERACTION_EXTENSION_NAME);
     if (m_capabilities.supportsCosmosController) enabledExtensions.emplace_back(XR_HTC_VIVE_COSMOS_CONTROLLER_INTERACTION_EXTENSION_NAME);
     if (m_capabilities.supportsHPMixedRealityController) enabledExtensions.emplace_back(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
+    if (m_capabilities.supportsFrameController) enabledExtensions.emplace_back("XR_VALVE_frame_controller_interaction");
 
     XrInstanceCreateInfo xrInstanceCreateInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
     xrInstanceCreateInfo.createFlags = 0;
@@ -434,7 +438,7 @@ void OpenXR::CreateActions() {
         bindings.inMenu_modMenuAction = m_inMenu_modMenuAction;
         bindings.inMenu_inventory_mapAction = m_inMenu_inventory_mapAction;
 
-        SuggestControllerBindings(m_instance, bindings, m_capabilities.supportsPicoController, m_capabilities.supportsPicoUltraController, m_capabilities.supportsCosmosController, m_capabilities.supportsHPMixedRealityController);
+        SuggestControllerBindings(m_instance, bindings, m_capabilities.supportsPicoController, m_capabilities.supportsPicoUltraController, m_capabilities.supportsCosmosController, m_capabilities.supportsHPMixedRealityController, m_capabilities.supportsFrameController);
     }
 
     XrSessionActionSetsAttachInfo attachInfo = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
@@ -538,8 +542,14 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
             poseState = { XR_TYPE_ACTION_STATE_POSE };
             checkXRResult(xrGetActionStatePose(m_session, &getPoseInfo, &poseState), errorContext);
 
+            // Linux/Steam Frame: keep the previous valid pose; a momentary miss (e.g. a stale prediction time at
+            // low game FPS) would otherwise drop the hand to the stage origin, i.e. the floor
+            const XrSpaceLocation lastLocation = outLocation;
             outLocation = { XR_TYPE_SPACE_LOCATION };
             if (!poseState.isActive) {
+#ifndef _WIN32
+                outLocation = lastLocation;
+#endif
                 if (outVelocity != nullptr) {
                     *outVelocity = { XR_TYPE_SPACE_VELOCITY };
                 }
@@ -555,6 +565,11 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
             }
 
             checkXRResult(xrLocateSpace(handSpace, m_stageSpace, predictedFrameTime, &spaceLocation), "Failed to get location from controllers!");
+#ifndef _WIN32
+            if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0 || (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
+                outLocation = lastLocation;
+            }
+#endif
             if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 && (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
                 outLocation = spaceLocation;
 

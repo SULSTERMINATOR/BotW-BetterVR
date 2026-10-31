@@ -10,7 +10,9 @@ static constexpr DWORD kLogFileShare = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#endif
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <ctime>
@@ -361,6 +363,7 @@ static void LogSystemHardwareInfo() {
         Log::print<INFO>("RAM: {:.2f} GiB", totalGiB);
     }
 #else
+#if defined(__x86_64__) || defined(__i386__)
     unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
     unsigned int maxExId = 0;
     if (__get_cpuid(0x80000000, &eax, &ebx, &ecx, &edx)) {
@@ -384,6 +387,7 @@ static void LogSystemHardwareInfo() {
             Log::print<INFO>("CPU: {}", cpuBrand.c_str());
         }
     }
+#endif
 
     struct sysinfo memInfo{};
     if (sysinfo(&memInfo) == 0) {
