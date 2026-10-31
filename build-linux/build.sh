@@ -16,7 +16,7 @@ STD=-std=c++23
 # references very recent Vulkan extension types that an older system package won't have.
 INCLUDES="${EXTRA_INCLUDES:-} -I $ROOT/include -I $ROOT/src -I $ROOT/build-deps/glm -I $ROOT/build-deps/imgui -I $ROOT/build-deps/implot -I $ROOT/build-deps/imgui_club/imgui_memory_editor -I $ROOT/dependencies"
 PCH="-include $ROOT/include/pch.h"
-COMMON_FLAGS="$STD -fPIC -O0 -g $INCLUDES"
+COMMON_FLAGS="$STD -fPIC ${OPT_FLAGS:--O0 -g} $INCLUDES"
 
 # NOTE: build-deps/imgui/backends is deliberately NOT on the include path - pch.h's
 # `#include <imgui_impl_vulkan.h>` must resolve to dependencies/imgui_impl_vulkan.h (the
@@ -94,7 +94,7 @@ if [ "$FAILED" -ne 0 ]; then
 fi
 
 echo "=== Linking BetterVR_Layer.so ==="
-$CXX -shared -fPIC -o "$ROOT/build-linux/BetterVR_Layer.so" "${OBJS[@]}" -lvulkan -lopenxr_loader -lpthread -ldl 2> "$OBJDIR/link.log"
+$CXX -shared -fPIC -o "$ROOT/build-linux/BetterVR_Layer.so" "${OBJS[@]}" ${EXTRA_LDFLAGS:-} -lvulkan -lopenxr_loader ${EXTRA_LIBS:-} -lpthread -ldl 2> "$OBJDIR/link.log"
 LINK_STATUS=$?
 if [ $LINK_STATUS -ne 0 ]; then
     echo "=== LINK FAILED ==="

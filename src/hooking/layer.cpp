@@ -11,9 +11,53 @@ static VkInstance s_deviceBInstance = VK_NULL_HANDLE;
 static VkDevice s_deviceBDevice = VK_NULL_HANDLE;
 
 namespace VRLayer {
-    bool IsDeviceBInstance(VkInstance instance) { return instance == s_deviceBInstance; }
-    bool IsDeviceBDevice(VkDevice device) { return device == s_deviceBDevice; }
+    thread_local bool g_creatingDeviceB = false;
+    bool IsDeviceBInstance(VkInstance instance) { return g_creatingDeviceB || instance == s_deviceBInstance; }
+    bool IsDeviceBDevice(VkDevice device) { return g_creatingDeviceB || device == s_deviceBDevice; }
+    void SetDeviceBHandles(VkInstance instance, VkDevice device) {
+        if (instance != VK_NULL_HANDLE) s_deviceBInstance = instance;
+        if (device != VK_NULL_HANDLE) s_deviceBDevice = device;
+    }
 }
+
+#ifndef _WIN32
+// Steam Frame / SteamVR: SteamVR's xrCreateVulkanInstanceKHR ignores the pfnGetInstanceProcAddr it is given and calls
+// the process-wide vkCreateInstance, which blocks on the Vulkan loader's lock if Device B is created from inside Cemu's
+// own vkCreateInstance (as on WiVRn). With BETTERVR_LINUX_EARLY_INIT=1 and this .so in LD_PRELOAD, the OpenXR instance
+// and Device B are created on a helper thread at process start, before Cemu creates its Vulkan instance.
+#include <dlfcn.h>
+static std::atomic_bool s_earlyInitStarted = false;
+static std::atomic_bool s_earlyInitDone = false;
+
+static bool EarlyInitEnabled() {
+    const char* e = std::getenv("BETTERVR_LINUX_EARLY_INIT");
+    return e && e[0] == '1' && std::getenv("ENABLE_BETTERVR_MOD");
+}
+
+__attribute__((constructor)) static void BetterVR_StartEarlyInit() {
+    if (!EarlyInitEnabled()) {
+        return;
+    }
+    s_earlyInitStarted = true;
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let the rest of this library's static init finish
+        VRManager::instance();
+        s_earlyInitDone = true;
+    }).detach();
+}
+
+static void WaitForEarlyInit() {
+    if (!s_earlyInitStarted) {
+        return;
+    }
+    for (int i = 0; i < 3000 && !s_earlyInitDone; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!s_earlyInitDone) {
+        Log::print<WARNING>("BetterVR early init still running after 30 s; continuing (may hang)");
+    }
+}
+#endif
 
 #ifdef _DEBUG
 static VkInstance s_debugMessengerInstance = VK_NULL_HANDLE;
@@ -61,15 +105,20 @@ VkResult VRLayer::VkInstanceOverrides::CreateInstance(PFN_vkCreateInstance creat
     // vkCreateInstance call reached this exact hook. Device B's instance is identified
     // by the distinct application name vulkan2.cpp gives it, and just needs to be
     // created normally - none of this layer's own VR-hooking logic applies to it.
-    if (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName &&
-        std::strcmp(pCreateInfo->pApplicationInfo->pApplicationName, "BetterVR_Layer_DeviceB") == 0) {
+    if (VRLayer::g_creatingDeviceB || (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName &&
+        std::strcmp(pCreateInfo->pApplicationInfo->pApplicationName, "BetterVR_Layer_DeviceB") == 0)) {
         VkResult result = createInstanceFunc(pCreateInfo, pAllocator, pInstance);
-        if (result == VK_SUCCESS) {
+        bool isDeviceBInstance = pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName &&
+            std::strcmp(pCreateInfo->pApplicationInfo->pApplicationName, "BetterVR_Layer_DeviceB") == 0;
+        if (result == VK_SUCCESS && isDeviceBInstance) {
             s_deviceBInstance = *pInstance;
         }
         return result;
     }
 
+#ifndef _WIN32
+    WaitForEarlyInit();
+#endif
     VkInstanceCreateInfo modifiedCreateInfo = *pCreateInfo;
     std::vector<const char*> modifiedExtensions;
     modifiedExtensions.reserve(pCreateInfo->enabledExtensionCount + 1);
@@ -173,7 +222,7 @@ VkResult VRLayer::VkInstanceOverrides::EnumeratePhysicalDevices(const vkroots::V
     // xrGetVulkanGraphicsDevice2KHR's own implementation enumerates physical devices on
     // Device B's instance internally, which - same as instance/device creation - goes
     // through every globally-active layer including this one.
-    if (instance == s_deviceBInstance) {
+    if (VRLayer::g_creatingDeviceB || instance == s_deviceBInstance) {
         return pDispatch.EnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
     }
 
@@ -287,9 +336,9 @@ VkResult VRLayer::VkInstanceOverrides::CreateDevice(const vkroots::VkPhysicalDev
     // own VkDevice via xrCreateVulkanDeviceKHR, which goes through every globally-active
     // layer including this one. Letting this hook's normal logic run on it would try to
     // touch VRManager::instance() from inside its own not-yet-finished construction again.
-    if (pDispatch.pInstanceDispatch->Instance == s_deviceBInstance) {
+    if (VRLayer::g_creatingDeviceB || pDispatch.pInstanceDispatch->Instance == s_deviceBInstance) {
         VkResult result = pDispatch.CreateDevice(gpu, pCreateInfo, pAllocator, pDevice);
-        if (result == VK_SUCCESS) {
+        if (result == VK_SUCCESS && pDispatch.pInstanceDispatch->Instance == s_deviceBInstance) {
             s_deviceBDevice = *pDevice;
         }
         return result;

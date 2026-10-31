@@ -6,7 +6,7 @@ moduleMatches = 0x6267BFD0
 ; flag to enable/disable printToCemuConsoleWithFormat (0 = enabled, nonzero = disabled)
 ; this is read in the printToCemuConsoleWithFormat function
 0x10416BF0 = DISABLE_PPC_LOGGING_SET: ; normally this is 0x556E6162
-0x10416BF0 = .int 0x00000000 ; set to 0 to enable logging
+0x10416BF0 = .int 0x00000001 ; set to 0 to enable logging (off: the per-call snprintf costs game-thread time)
 
 
 str_WeaponR:

@@ -16,6 +16,10 @@ namespace VRLayer {
     // straight through for Device B.
     bool IsDeviceBInstance(VkInstance instance);
     bool IsDeviceBDevice(VkDevice device);
+    // Set on the creating thread while RND_Vulkan2 runs xrCreateVulkanInstanceKHR/xrCreateVulkanDeviceKHR. SteamVR
+    // creates the instance with its own VkApplicationInfo, so the application-name check alone misses it there.
+    extern thread_local bool g_creatingDeviceB;
+    void SetDeviceBHandles(VkInstance instance, VkDevice device);
 
     class VkInstanceOverrides {
     public:
