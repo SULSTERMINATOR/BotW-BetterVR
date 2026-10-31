@@ -1,0 +1,43 @@
+# Top guest functions on the main emulated core (OSSched[core=1], thread 'Default Core 1'), BotW v208 stereo gameplay
+# Source: runs/cpuprof2/perf.data + CEMU_PERF_MAP (symbol = PPC entry of the recompiled unit). % = share of ALL core1 samples
+# (core1 = 48.8% JIT, 27.8% vdso idle spin, 16.9% Cemu native incl. idle loop/HLE). Profile is flat: 3300+ units, top unit 1.5%.
+# Names: U-King.rpx is stripped; units below are game code (0x02000000+), identification not verified.
+     1.52%  [.] ppc_0x0399b3b4
+     1.17%  [.] ppc_0x039f4540
+     0.64%  [.] ppc_0x039f383c
+     0.44%  [.] ppc_0x0399ed84
+     0.37%  [.] ppc_0x032e9a04
+     0.35%  [.] ppc_0x0420ca64
+     0.35%  [.] ppc_0x036d0944
+     0.34%  [.] ppc_0x03bfa1b8
+     0.33%  [.] ppc_0x03a24b30
+     0.27%  [.] ppc_0x03a833ec
+     0.26%  [.] ppc_0x03ac42d8
+     0.25%  [.] ppc_0x0378b92c
+     0.25%  [.] ppc_0x03973780
+     0.25%  [.] ppc_0x0399cd70
+     0.24%  [.] ppc_0x036c9810
+     0.24%  [.] ppc_0x0399c9b4
+     0.24%  [.] ppc_0x03906d3c
+     0.22%  [.] ppc_0x03b6ba64
+     0.22%  [.] ppc_0x03b4f8e4
+     0.21%  [.] ppc_0x03a82dc8
+     0.19%  [.] ppc_0x035cc084
+     0.18%  [.] ppc_0x039eca9c
+     0.18%  [.] ppc_0x0391c098
+     0.18%  [.] ppc_0x0399b008
+     0.18%  [.] ppc_0x036d0e40
+
+# Same from cpuprof1 (independent run) for stability:
+     1.52%  [.] ppc_0x0399b3b4
+     1.10%  [.] ppc_0x039f4540
+     0.67%  [.] ppc_0x039f383c
+     0.44%  [.] ppc_0x0399ed84
+     0.43%  [.] ppc_0x03bfa1b8
+     0.39%  [.] ppc_0x03a24b30
+     0.35%  [.] ppc_0x036d0944
+     0.33%  [.] ppc_0x032e9a04
+     0.31%  [.] ppc_0x0378b92c
+     0.30%  [.] ppc_0x0399cd70
+
+# core1 JIT share per 1MB region (cpuprof1): 0x039xxxxx 10.6%, 0x03Axxxxx 6.5%, 0x03Bxxxxx 5.9%, 0x036xxxxx 3.7%, 0x00Exxxxx 2.5%, 0x037xxxxx 2.3%

@@ -1,0 +1,1543 @@
+diff --git a/include/platform/pch_posix.h b/include/platform/pch_posix.h
+index 2f367d4..faff99a 100644
+--- a/include/platform/pch_posix.h
++++ b/include/platform/pch_posix.h
+@@ -6,7 +6,9 @@
+ #include <csignal>
+ #include <sys/sysinfo.h>
+ #include <unistd.h>
++#if defined(__x86_64__) || defined(__i386__)
+ #include <cpuid.h>
++#endif
+ #include <strings.h>
+ 
+ // MSVC CRT names used by the shared codebase, mapped to their POSIX equivalents.
+diff --git a/resources/BreathOfTheWild_BetterVR/patch_RND_StereoRendering.asm b/resources/BreathOfTheWild_BetterVR/patch_RND_StereoRendering.asm
+index 576ae00..0c863f8 100644
+--- a/resources/BreathOfTheWild_BetterVR/patch_RND_StereoRendering.asm
++++ b/resources/BreathOfTheWild_BetterVR/patch_RND_StereoRendering.asm
+@@ -133,12 +133,26 @@ bctrl ; bl calculateUIMaybe
+ ; FIRST EYE SIDE
+ ; ========================================================================
+ 
++; mono rendering: decides this frame; skip drawing the previous frame's right eye if it had none
++li r3, 0
++bl import.coreinit.hook_IsMonoRender
++cmpwi r3, 0
++bne skipRightEyeProcDraw_mono
++
+ lwz r12, 0(r30)
+ lwz r0, 0xF4(r12)
+ mtctr r0
+ mr r3, r30
+ bctrl ; sead__GameFrameworkCafe__procDraw
+ 
++skipRightEyeProcDraw_mono:
++
++; remember whether this frame is mono, for patches that otherwise assume a right eye pass follows the left one
++li r3, 4
++bl import.coreinit.hook_IsMonoRender
++lis r12, monoFrameActive@ha
++stw r3, monoFrameActive@l(r12)
++
+ ; doesn't seem to be necessary
+ ;bl import.gx2.GX2DrawDone
+ 
+@@ -165,12 +179,22 @@ stw r0, currentEyeSide@l(r12)
+ li r3, 0
+ bl import.coreinit.hook_BeginCameraSide
+ 
++; mono experiment: hook_IsMonoRender(2) returns the eye side to run the left calcDraw as
++li r3, 2
++bl import.coreinit.hook_IsMonoRender
++lis r12, currentEyeSide@ha
++stw r3, currentEyeSide@l(r12)
++
+ lwz r12, 0(r30)
+ lwz r11, 0xFC(r12)
+ mtctr r11
+ mr r3, r30
+ bctrl ; sead__GameFrameworkCafe__calcDraw
+ 
++li r0, 0
++lis r12, currentEyeSide@ha
++stw r0, currentEyeSide@l(r12)
++
+ lwz r12, 0(r30)
+ lwz r0, 0x7C(r12)
+ mtctr r0
+@@ -196,7 +220,13 @@ bctrl ; sead__GameFrameworkCafe__procDraw
+ 
+ ; this is a replacement for a GX2DrawDone that prevents command buffers from being corrupted
+ bl storeLastSubmittedTimeStamp
++; mono frames have no right eye pass that could recycle the left eye's command buffers, so don't wait
++lis r12, monoFrameActive@ha
++lwz r12, monoFrameActive@l(r12)
++cmpwi r12, 0
++bne skipWaitLeftEye_mono
+ bl waitForLastSubmittedTimeStamp
++skipWaitLeftEye_mono:
+ ;bl import.gx2.GX2DrawDone
+ 
+ ; note: doesn't seem to be necessary
+@@ -223,18 +253,49 @@ skipStallDuringLoadingScreens_one:
+ li r3, 0
+ bl import.coreinit.hook_EndCameraSide
+ 
++; mono rendering: skip the right eye's calcDraw (and its procDraw at the start of the next frame)
++li r3, 1
++bl import.coreinit.hook_IsMonoRender
++cmpwi r3, 2
++beq secondCalcDrawAsLeft_mono
++cmpwi r3, 3
++beq rightSideOnly_mono
++cmpwi r3, 0
++bne skipRightEyeCalcDraw_mono
+ 
+ li r0, 1
+ lis r12, currentEyeSide@ha
+ stw r0, currentEyeSide@l(r12)
+ li r3, 1
+ bl import.coreinit.hook_BeginCameraSide
++b doSecondCalcDraw_mono
+ 
++; mono experiment: repeat the left eye's calcDraw instead of the right eye's
++secondCalcDrawAsLeft_mono:
++li r0, 0
++lis r12, currentEyeSide@ha
++stw r0, currentEyeSide@l(r12)
++li r3, 0
++bl import.coreinit.hook_BeginCameraSide
++
++doSecondCalcDraw_mono:
+ lwz r12, 0(r30)
+ lwz r11, 0xFC(r12)
+ mtctr r11
+ mr r3, r30
+ bctrl ; sead__GameFrameworkCafe__calcDraw
++b skipRightEyeCalcDraw_mono
++
++; mono experiment: switch to the right eye side without its calcDraw
++rightSideOnly_mono:
++li r0, 1
++lis r12, currentEyeSide@ha
++stw r0, currentEyeSide@l(r12)
++li r3, 1
++bl import.coreinit.hook_BeginCameraSide
++b skipRightEyeCalcDraw_mono
++
++skipRightEyeCalcDraw_mono:
+ 
+ lwz r12, 0(r30)
+ lwz r0, 0x7C(r12)
+@@ -747,7 +808,15 @@ blr
+ ; ==================================================================================
+ 
+ 
++monoFrameActive:
++.int 0
++
+ preventUnrequestingDraw:
++; mono frames have no right eye pass to clear the draw request, so behave like the unmodified game
++lis r3, monoFrameActive@ha
++lwz r3, monoFrameActive@l(r3)
++cmpwi r3, 0
++bne keepRequestDraw
+ lis r3, currentEyeSide@ha
+ lwz r3, currentEyeSide@l(r3)
+ cmpwi r3, 1
+diff --git a/resources/BreathOfTheWild_BetterVR/patch_debug_CTRL_Logging.asm b/resources/BreathOfTheWild_BetterVR/patch_debug_CTRL_Logging.asm
+index b133980..7049615 100644
+--- a/resources/BreathOfTheWild_BetterVR/patch_debug_CTRL_Logging.asm
++++ b/resources/BreathOfTheWild_BetterVR/patch_debug_CTRL_Logging.asm
+@@ -6,7 +6,7 @@ moduleMatches = 0x6267BFD0
+ ; flag to enable/disable printToCemuConsoleWithFormat (0 = enabled, nonzero = disabled)
+ ; this is read in the printToCemuConsoleWithFormat function
+ 0x10416BF0 = DISABLE_PPC_LOGGING_SET: ; normally this is 0x556E6162
+-0x10416BF0 = .int 0x00000000 ; set to 0 to enable logging
++0x10416BF0 = .int 0x00000001 ; set to 0 to enable logging (off: the per-call snprintf costs game-thread time)
+ 
+ 
+ str_WeaponR:
+diff --git a/src/hooking/camera.cpp b/src/hooking/camera.cpp
+index 02814d5..7251910 100644
+--- a/src/hooking/camera.cpp
++++ b/src/hooking/camera.cpp
+@@ -32,10 +32,100 @@ static std::optional<XrFovf> TryGetRenderFOV(OpenXR::EyeSide side, long frameIdx
+     return RenderUtils::GetRenderFov(renderer->GetFOV(side, frameIdx), renderer->m_gameRenderAspectRatio);
+ }
+ 
++std::atomic<int> g_ppcTraceFrames{0};
++
++#ifndef _WIN32
++// BETTERVR_LINUX_WRITEWATCH=<hex address>[:<bytes>]: during the trace window, write-protect the guest page holding
++// that range and record the PPC context (IP, LR) of every write into it. Debugging aid for the mono rendering work.
++#include <signal.h>
++#include <sys/mman.h>
++#include <dlfcn.h>
++namespace WriteWatch {
++    struct Hit { uint32_t ip, lr, r3, offset; int phase; uint32_t oldValue; };
++    std::atomic<int> s_phase{0};
++    static uint8_t* s_page = nullptr;
++    static uintptr_t s_lo = 0, s_hi = 0;
++    static std::atomic<bool> s_armed{false}, s_active{false};
++    static struct sigaction s_prev = {};
++    static PPCInterpreter_t* (*s_getCpu)() = nullptr;
++    static Hit s_hits[4096];
++    static std::atomic<uint32_t> s_hitCount{0};
++
++    static void Handler(int sig, siginfo_t* info, void* uctx) {
++        uintptr_t a = (uintptr_t)info->si_addr;
++        if (s_page && a >= (uintptr_t)s_page && a < (uintptr_t)s_page + 4096) {
++            if (a >= s_lo && a < s_hi) {
++                uint32_t n = s_hitCount.fetch_add(1);
++                PPCInterpreter_t* cpu = s_getCpu ? s_getCpu() : nullptr;
++                if (n < 4096) s_hits[n] = { cpu ? cpu->instructionPointer : 0, cpu ? cpu->sprNew.LR : 0, cpu ? cpu->gpr[3] : 0, (uint32_t)(a - s_lo), s_phase.load(), __builtin_bswap32(*(uint32_t*)(a & ~(uintptr_t)3)) };
++            }
++            mprotect(s_page, 4096, PROT_READ | PROT_WRITE);
++            s_armed = false;
++            return;
++        }
++        if (s_prev.sa_flags & SA_SIGINFO) s_prev.sa_sigaction(sig, info, uctx);
++        else if (s_prev.sa_handler != SIG_DFL && s_prev.sa_handler != SIG_IGN) s_prev.sa_handler(sig);
++        else { signal(sig, SIG_DFL); raise(sig); }
++    }
++
++    static void Start() {
++        const char* e = getenv("BETTERVR_LINUX_WRITEWATCH");
++        if (!e || s_active.exchange(true)) return;
++        uint32_t guest = (uint32_t)strtoul(e, nullptr, 16);
++        const char* colon = strchr(e, ':');
++        uint32_t len = colon ? (uint32_t)strtoul(colon + 1, nullptr, 0) : 4;
++        s_lo = (uintptr_t)(CemuHooks::s_memoryBaseAddress + guest);
++        s_hi = s_lo + len;
++        s_page = (uint8_t*)(s_lo & ~(uintptr_t)4095);
++        s_getCpu = (PPCInterpreter_t* (*)())dlsym(RTLD_DEFAULT, "_Z33PPCInterpreter_getCurrentInstancev");
++        struct sigaction sa = {};
++        sa.sa_sigaction = Handler;
++        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
++        sigemptyset(&sa.sa_mask);
++        sigaction(SIGSEGV, &sa, &s_prev);
++        std::thread([] {
++            while (s_active.load()) {
++                if (!s_armed.load()) {
++                    s_armed = true;
++                    mprotect(s_page, 4096, PROT_READ);
++                }
++                std::this_thread::sleep_for(std::chrono::microseconds(20));
++            }
++            mprotect(s_page, 4096, PROT_READ | PROT_WRITE);
++        }).detach();
++        Log::print<INFO>("[WriteWatch] watching {:08X}+{} (page {}), getCpu={}", guest, len, (void*)s_page, (void*)s_getCpu);
++    }
++
++    static void StopAndReport() {
++        if (!s_active.exchange(false)) return;
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++        uint32_t n = std::min<uint32_t>(s_hitCount.load(), 4096);
++        std::map<std::tuple<uint32_t, uint32_t, uint32_t>, int> counts;
++        for (uint32_t i = 0; i < n; i++) counts[{ s_hits[i].ip, s_hits[i].lr, s_hits[i].offset }]++;
++        Log::print<INFO>("[WriteWatch] {} writes", s_hitCount.load());
++        for (uint32_t i = 0; i < std::min<uint32_t>(n, 80); i++)
++            Log::print<INFO>("[WriteWatch] #{} phase={} ip={:08X} lr={:08X} old={}", i, s_hits[i].phase, s_hits[i].ip, s_hits[i].lr, (int32_t)s_hits[i].oldValue);
++        for (auto& [k, c] : counts) Log::print<INFO>("[WriteWatch] ip={:08X} lr={:08X} offset=+{:X} x{}", std::get<0>(k), std::get<1>(k), std::get<2>(k), c);
++    }
++}
++#endif
++
++// BETTERVR_LINUX_WATCH=<hex address>: big-endian u32 printed with each trace marker
++static std::string TraceWatch() {
++    static const uint32_t s_addr = [] { const char* e = getenv("BETTERVR_LINUX_WATCH"); return e ? (uint32_t)strtoul(e, nullptr, 16) : 0u; }();
++    if (s_addr == 0) return {};
++    uint32_t v = __builtin_bswap32(*(uint32_t*)(CemuHooks::s_memoryBaseAddress + s_addr));
++    return std::format(" watch[{:08X}]={}", s_addr, (int32_t)v);
++}
++
+ void CemuHooks::hook_BeginCameraSide(PPCInterpreter_t* hCPU) {
+     hCPU->instructionPointer = hCPU->sprNew.LR;
+ 
+     OpenXR::EyeSide side = hCPU->gpr[0] == 0 ? OpenXR::EyeSide::LEFT : OpenXR::EyeSide::RIGHT;
++    if (g_ppcTraceFrames.load() > 0) Log::print<INFO>("[PPCTrace] ----- BeginCameraSide r3={} -----{}", hCPU->gpr[3], TraceWatch());
++#ifndef _WIN32
++    WriteWatch::s_phase = hCPU->gpr[3] == 0 ? 3 : 5;
++#endif
+ 
+     Log::print<RENDERING>("");
+     Log::print<RENDERING>("===============================================================================");
+@@ -405,6 +495,15 @@ void CemuHooks::hook_GetRenderCamera(PPCInterpreter_t* hCPU) {
+     auto [gameplayPos, gameplayRot] = ResolveGameplayBasePose(camera);
+     UpdateGameplayReferenceCameraMtx(gameplayPos, gameplayRot);
+     auto [newPos, newRot] = BuildGameplayCameraPose(gameplayPos, gameplayRot, side);
++#ifndef _WIN32
++    static const bool s_camDiag = getenv("BETTERVR_LINUX_CAPTURE_DIAG") != nullptr;
++    static uint32_t s_camDiagCount[2] = {};
++    if (s_camDiag && (s_camDiagCount[(int)side]++ % 120) == 0) {
++        Log::print<INFO>("[CamDiag] side={} mono={} gameplay=({:.1f},{:.1f},{:.1f}) out=({:.1f},{:.1f},{:.1f}) sinceCamUpdate={}",
++            (int)side, IsMonoFrame(), gameplayPos.x, gameplayPos.y, gameplayPos.z, newPos.x, newPos.y, newPos.z,
++            GetFramesSinceLastCameraUpdate());
++    }
++#endif
+ 
+     glm::mat4 newWorldVR = glm::translate(glm::mat4(1.0f), newPos) * glm::mat4_cast(newRot);
+     glm::mat4 newViewVR = glm::inverse(newWorldVR);
+@@ -453,6 +552,15 @@ void CemuHooks::hook_GetRenderProjection(PPCInterpreter_t* hCPU) {
+     readMemory(projectionIn, &perspectiveProjection);
+ 
+     Log::print<RENDERING>("[{}] Render Proj. (LR: {:08X}): {}", side, hCPU->sprNew.LR, perspectiveProjection);
++#ifndef _WIN32
++    static const bool s_projDiag = getenv("BETTERVR_LINUX_CAPTURE_DIAG") != nullptr;
++    static uint32_t s_projDiagCount[2] = {};
++    if (s_projDiag && (s_projDiagCount[(int)side]++ % 240) == 0) {
++        Log::print<INFO>("[ProjDiag] side={} mono={} LR={:08X} in: near={:.3f} far={:.1f} fovY={:.3f} aspect={:.3f}",
++            (int)side, IsMonoFrame(), hCPU->sprNew.LR, perspectiveProjection.zNear.getLE(), perspectiveProjection.zFar.getLE(),
++            perspectiveProjection.fovYRadiansOrAngle.getLE(), perspectiveProjection.aspect.getLE());
++    }
++#endif
+ 
+     if (perspectiveProjection.zFar == 10000.0f) {
+         return;
+@@ -732,10 +840,170 @@ void CemuHooks::hook_ModifyPixelUniformBlockData(PPCInterpreter_t* hCPU) {
+     writeMemory(hCPU->gpr[5], &ubData);
+ }
+ 
++// Mono rendering (BETTERVR_LINUX_MONO=1): during gameplay the stereo patch skips the right eye's draw pass
++// and the Linux renderer submits the left eye's image and depth for both eyes, leaving the right eye to the
++// runtime's reprojection. Roughly halves the per-frame render cost. Loading screens and menus stay stereo:
++// loading stalls without the right eye pass.
++// r3 = 0 at the start of a frame: decides this frame, returns whether the previous frame skipped its right eye
++//        (and so has no right eye procDraw pending)
++// r3 = 1 before the right eye's calcDraw: returns whether this frame skips it
++std::atomic_bool CemuHooks::s_monoFrame = false;
++
++void CemuHooks::hook_IsMonoRender(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    static const bool s_enabled = [] { const char* e = getenv("BETTERVR_LINUX_MONO"); return e && e[0] == '1'; }();
++    if (hCPU->gpr[3] == 0) {
++        // BETTERVR_LINUX_PPC_TRACE=N: after N gameplay frames, log every PPC console line for 3 frames
++        static const int s_traceAt = [] { const char* e = getenv("BETTERVR_LINUX_PPC_TRACE"); return e ? atoi(e) : 0; }();
++        static int s_gameplayFrames = 0;
++        if (g_ppcTraceFrames.load() > 0) g_ppcTraceFrames--;
++        if (s_traceAt > 0 && !IsShowingMenu() && ++s_gameplayFrames == s_traceAt) g_ppcTraceFrames = 4;
++#ifndef _WIN32
++        WriteWatch::s_phase = 1;
++        if (g_ppcTraceFrames.load() == 4) WriteWatch::Start();
++        if (g_ppcTraceFrames.load() == 1) WriteWatch::StopAndReport();
++#endif
++        if (g_ppcTraceFrames.load() > 0) Log::print<INFO>("[PPCTrace] ===== frame start (mono={}) ====={}", s_monoFrame.load(), TraceWatch());
++        bool previous = s_monoFrame.load();
++        s_monoFrame = s_enabled && !IsShowingMenu();
++        static const bool s_keepTopDraw = [] { const char* e = getenv("BETTERVR_LINUX_MONO_KEEP_TOP"); return e && e[0] == '1'; }();
++        hCPU->gpr[3] = (previous && !s_keepTopDraw) ? 1 : 0;
++    }
++    else if (hCPU->gpr[3] == 4) {
++        // whether the current frame is mono (stored by the stereo patch for its draw request patch)
++        hCPU->gpr[3] = s_monoFrame.load() ? 1 : 0;
++    }
++    else if (hCPU->gpr[3] == 2) {
++        // eye side for the left eye's calcDraw (BETTERVR_LINUX_MONO_LEFT_CALC_SIDE=1 runs it as the right eye in mono frames)
++        static const bool s_asRight = [] { const char* e = getenv("BETTERVR_LINUX_MONO_LEFT_CALC_SIDE"); return e && e[0] == '1'; }();
++        static int s_monoFrames = 0;
++        s_monoFrames = s_monoFrame.load() ? s_monoFrames + 1 : 0;
++        hCPU->gpr[3] = (s_asRight && s_monoFrames > 600) ? 1 : 0; // only once gameplay has settled: boot crashes otherwise
++    }
++    else {
++        // 0 = right eye calcDraw, 1 = skip it, 2 = repeat the left eye's calcDraw (BETTERVR_LINUX_MONO_CALC2=left)
++        static const bool s_calc2Left = [] { const char* e = getenv("BETTERVR_LINUX_MONO_CALC2"); return e && std::string_view(e) == "left"; }();
++        // 3 = skip it but still switch to the right eye side (BETTERVR_LINUX_MONO_CALC2=side)
++        static const bool s_sideOnly = [] { const char* e = getenv("BETTERVR_LINUX_MONO_CALC2"); return e && std::string_view(e) == "side"; }();
++        if (!s_monoFrame.load()) hCPU->gpr[3] = 0;
++        else if (s_calc2Left) hCPU->gpr[3] = 2;
++        else if (s_sideOnly) hCPU->gpr[3] = 3;
++        else hCPU->gpr[3] = MonoKeepsRightCalc() ? 0 : 1;
++    }
++}
++
++// replaces `lbz r5, 4(r22)` at 0x039F1604 (draw item push: per-shape visibility byte, compared with the view's mask at 0xB(r15))
++void CemuHooks::hook_TraceVisibility(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    hCPU->gpr[5] = mem[hCPU->gpr[22] + 4];
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 120) {
++        uint32_t r15 = hCPU->gpr[15];
++        Log::print<INFO>("[PPCTrace] vis: unit={:08X} shapeVis@{:08X}={:02X} viewMask={:02X} view={} r27={} r16={} r28={} r19={} items={:08X}",
++            hCPU->gpr[30], hCPU->gpr[22], hCPU->gpr[5], mem[r15 + 0xB], hCPU->gpr[16], hCPU->gpr[27], hCPU->gpr[16], hCPU->gpr[28], hCPU->gpr[19], r15);
++    }
++}
++
++// replaces `sth r31, 0xC(r26)` at 0x039E6FD4 (model unit draw dispatch: r31 = visible view count, 0 skips the push)
++void CemuHooks::hook_TraceVisibleCount(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    uint16_t v = (uint16_t)hCPU->gpr[31];
++    mem[hCPU->gpr[26] + 0xC] = v >> 8;
++    mem[hCPU->gpr[26] + 0xD] = v & 0xFF;
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 300) {
++        Log::print<INFO>("[PPCTrace] visCount: unit={:08X} count={} r29={:08X} r25={:08X} r24={:08X}", hCPU->gpr[26], v, hCPU->gpr[29], hCPU->gpr[25], hCPU->gpr[24]);
++    }
++}
++
++// replaces `lbz r0, 0x12(r12)` at 0x03A246A0 (model scene stage 0: unit flags, 0x10 = collect for drawing)
++void CemuHooks::hook_TraceUnitFlags(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    hCPU->gpr[0] = mem[hCPU->gpr[12] + 0x12];
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 300) {
++        Log::print<INFO>("[PPCTrace] unitFlags: model={:08X} unit={:08X} flags={:02X}", hCPU->gpr[26], hCPU->gpr[12], hCPU->gpr[0]);
++    }
++}
++
++// replaces `stw r0, 0x34(r1)` at 0x03A245A4 (model scene stage worker prologue: r3/r27 = scene, r4 = stage, r5 = slice, r6..r7 = range)
++void CemuHooks::hook_TraceStageArgs(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    *(uint32_t*)(mem + hCPU->gpr[1] + 0x34) = __builtin_bswap32(hCPU->gpr[0]);
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 200) {
++        uint32_t sc = hCPU->gpr[27];
++        auto rd = [&](uint32_t off) { return __builtin_bswap32(*(uint32_t*)(mem + sc + off)); };
++        Log::print<INFO>("[PPCTrace] stage: scene={:08X} stage={} slice={} range={}..{} models(ac)={} collected(c4)={}",
++            sc, hCPU->gpr[4], (int32_t)hCPU->gpr[5], hCPU->gpr[6], hCPU->gpr[7], rd(0xac), rd(0xc4));
++    }
++}
++
++// replaces `lis r25, 0x1048` at 0x03A13728 (gsys system task calc, right before the model scene stage 0 call)
++void CemuHooks::hook_TraceSystemTaskCalc(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    hCPU->gpr[25] = 0x10480000;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 50) {
++        Log::print<INFO>("[PPCTrace] systemTaskCalc: task={:08X} modelSceneMgr={:08X}", hCPU->gpr[30], __builtin_bswap32(*(uint32_t*)(mem + 0x1047DC04)));
++    }
++}
++
++// replaces `lwz r7, 0xAC(r29)` at 0x03A24B00 (model scene stage 0: model count before splitting into jobs)
++void CemuHooks::hook_TraceSceneModelCount(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    uint32_t sc = hCPU->gpr[29];
++    auto rd = [&](uint32_t off) { return __builtin_bswap32(*(uint32_t*)(mem + sc + off)); };
++    hCPU->gpr[7] = rd(0xAC);
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 50) {
++        Log::print<INFO>("[PPCTrace] sceneModels: scene={:08X} count(ac)={} jobQueue={:08X} d0={:08X} d4={:08X} b8={:08X} b0={} b4={:08X}",
++            sc, rd(0xAC), hCPU->gpr[31], rd(0xD0), rd(0xD4), rd(0xB8), rd(0xB0), rd(0xB4));
++    }
++}
++
++// replaces `lwz r4, 0x4FC(r28)` at 0x0379D9C0 (actor virtual that registers its model with the model scene, r28 = actor)
++void CemuHooks::hook_TraceActorModelCalc(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    auto rd = [&](uint32_t a) { return __builtin_bswap32(*(uint32_t*)(mem + a)); };
++    uint32_t actor = hCPU->gpr[28];
++    hCPU->gpr[4] = rd(actor + 0x4FC);
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 40) {
++        uint32_t g = rd(0x1046CA64);
++        Log::print<INFO>("[PPCTrace] actorModelCalc: actor={:08X} model330={:08X} lr={:08X} global={:08X} globalFlags={:08X} side={}",
++            actor, rd(actor + 0x330), hCPU->sprNew.LR, g, g ? rd(g + 0x18) : 0, rd(0x10000000) /*placeholder*/ ? 0 : 0);
++    }
++}
++
++// replaces `lwz r3, 0x200(r30)` at 0x02C2C3D0 (game calc, before the world model registration call)
++void CemuHooks::hook_TraceGameCalcGate(PPCInterpreter_t* hCPU) {
++    hCPU->instructionPointer = hCPU->sprNew.LR;
++    uint8_t* mem = (uint8_t*)s_memoryBaseAddress;
++    auto rd = [&](uint32_t a) { return __builtin_bswap32(*(uint32_t*)(mem + a)); };
++    hCPU->gpr[3] = rd(hCPU->gpr[30] + 0x200);
++    static std::atomic<int> s_logged = 0;
++    if (g_ppcTraceFrames.load() > 0 && s_logged++ < 40) {
++        Log::print<INFO>("[PPCTrace] gameCalcGate: this={:08X} x200={:08X} g63E64={} gF550={} gF564={} gC728={:08X}",
++            hCPU->gpr[30], hCPU->gpr[3], rd(0x10463E64), rd(0x1046F550), rd(0x1046F564), rd(0x1047C728));
++    }
++}
++
+ void CemuHooks::hook_EndCameraSide(PPCInterpreter_t* hCPU) {
+     hCPU->instructionPointer = hCPU->sprNew.LR;
+ 
+     OpenXR::EyeSide side = hCPU->gpr[3] == 0 ? OpenXR::EyeSide::LEFT : OpenXR::EyeSide::RIGHT;
++    if (g_ppcTraceFrames.load() > 0) Log::print<INFO>("[PPCTrace] ----- EndCameraSide r3={} -----{}", hCPU->gpr[3], TraceWatch());
++#ifndef _WIN32
++    WriteWatch::s_phase = hCPU->gpr[3] == 0 ? 4 : 2;
++#endif
+ 
+     // todo: sometimes this can deadlock apparently?
+     if (VRManager::instance().XR->GetRenderer()->IsInitialized() && side == OpenXR::EyeSide::RIGHT) {
+diff --git a/src/hooking/cemu_hooks.h b/src/hooking/cemu_hooks.h
+index f40222b..0070c36 100644
+--- a/src/hooking/cemu_hooks.h
++++ b/src/hooking/cemu_hooks.h
+@@ -51,6 +51,15 @@ public:
+         osLib_registerHLEFunction("coreinit", "hook_GetRenderCamera", &hook_GetRenderCamera);
+         osLib_registerHLEFunction("coreinit", "hook_GetRenderProjection", &hook_GetRenderProjection);
+         osLib_registerHLEFunction("coreinit", "hook_EndCameraSide", &hook_EndCameraSide);
++        osLib_registerHLEFunction("coreinit", "hook_IsMonoRender", &hook_IsMonoRender);
++        osLib_registerHLEFunction("coreinit", "hook_TraceVisibility", &hook_TraceVisibility);
++        osLib_registerHLEFunction("coreinit", "hook_TraceVisibleCount", &hook_TraceVisibleCount);
++        osLib_registerHLEFunction("coreinit", "hook_TraceUnitFlags", &hook_TraceUnitFlags);
++        osLib_registerHLEFunction("coreinit", "hook_TraceStageArgs", &hook_TraceStageArgs);
++        osLib_registerHLEFunction("coreinit", "hook_TraceSystemTaskCalc", &hook_TraceSystemTaskCalc);
++        osLib_registerHLEFunction("coreinit", "hook_TraceSceneModelCount", &hook_TraceSceneModelCount);
++        osLib_registerHLEFunction("coreinit", "hook_TraceActorModelCalc", &hook_TraceActorModelCalc);
++        osLib_registerHLEFunction("coreinit", "hook_TraceGameCalcGate", &hook_TraceGameCalcGate);
+         osLib_registerHLEFunction("coreinit", "hook_RouteActorJob", &hook_RouteActorJob);
+ 
+         osLib_registerHLEFunction("coreinit", "hook_UseCameraDistance", &hook_UseCameraDistance);
+@@ -129,7 +138,17 @@ public:
+     static uint32_t GetFramesSinceLastCameraUpdate() { return s_framesSinceLastCameraUpdate.load(); }
+     static bool IsInGame() {
+         // todo: check if 3 frames is the right threshold
+-        return GetFramesSinceLastCameraUpdate() <= 4 && !IsScreenOpen(ScreenId::PauseMenuInfo_00);
++        // Mono rendering runs frames fast enough that the camera update sometimes skips more than 4 of them,
++        // which flickered between gameplay and menu; menus and loading screens stop it entirely.
++        return GetFramesSinceLastCameraUpdate() <= (IsMonoFrame() ? 12u : 4u) && !IsScreenOpen(ScreenId::PauseMenuInfo_00);
++    }
++    static std::atomic_bool s_monoFrame; // the current frame renders only the left eye (see hook_IsMonoRender)
++    static bool IsMonoFrame() { return s_monoFrame.load(); }
++    // BETTERVR_LINUX_MONO_KEEP_CALC=1: mono frames still run the right eye's calcDraw (the next frame's left eye
++    // needs it) and only skip its procDraw, i.e. the right eye's GPU commands and rendering
++    static bool MonoKeepsRightCalc() {
++        static const bool s_keep = [] { const char* e = getenv("BETTERVR_LINUX_MONO_KEEP_CALC"); return e && e[0] == '1'; }();
++        return s_keep;
+     }
+     static bool IsShowingMenu() {
+         return !IsInGame() || IsScreenOpen(ScreenId::ShopBG_00) || IsScreenOpen(ScreenId::MessageDialog);
+@@ -224,6 +243,15 @@ private:
+     static void hook_GetRenderCamera(PPCInterpreter_t* hCPU);
+     static void hook_GetRenderProjection(PPCInterpreter_t* hCPU);
+     static void hook_EndCameraSide(PPCInterpreter_t* hCPU);
++    static void hook_IsMonoRender(PPCInterpreter_t* hCPU);
++    static void hook_TraceVisibility(PPCInterpreter_t* hCPU);
++    static void hook_TraceVisibleCount(PPCInterpreter_t* hCPU);
++    static void hook_TraceUnitFlags(PPCInterpreter_t* hCPU);
++    static void hook_TraceStageArgs(PPCInterpreter_t* hCPU);
++    static void hook_TraceSystemTaskCalc(PPCInterpreter_t* hCPU);
++    static void hook_TraceSceneModelCount(PPCInterpreter_t* hCPU);
++    static void hook_TraceActorModelCalc(PPCInterpreter_t* hCPU);
++    static void hook_TraceGameCalcGate(PPCInterpreter_t* hCPU);
+     static void hook_RouteActorJob(PPCInterpreter_t* hCPU);
+ 
+     static void hook_UseCameraDistance(PPCInterpreter_t* hCPU);
+diff --git a/src/hooking/controls.cpp b/src/hooking/controls.cpp
+index 568bee4..855713b 100644
+--- a/src/hooking/controls.cpp
++++ b/src/hooking/controls.cpp
+@@ -839,6 +839,13 @@ void processInputPrevention(OpenXR::GameState& gameState, std::chrono::steady_cl
+ 
+ void processModMenuInput(std::atomic_bool& isMenuOpen, OpenXR::InputState& inputs, VPADStatus& vpadInputs, RND_Renderer::ImGuiOverlay* imguiOverlay, XrActionStateVector2f& leftStickSource, XrActionStateVector2f& rightStickSource)
+ {
++    if (!imguiOverlay) {
++        // no overlay means no visible mod menu, so never let it swallow game input
++        isMenuOpen = false;
++        inputs.shared.modMenuState.longFired_actedUpon = false;
++        return;
++    }
++
+     if (inputs.shared.modMenuState.lastEvent == ButtonState::Event::LongPress && inputs.shared.modMenuState.longFired_actedUpon) {
+         isMenuOpen = !isMenuOpen;
+         inputs.shared.modMenuState.longFired_actedUpon = false;
+@@ -953,6 +960,9 @@ void updatePreviousValues(OpenXR::GameState& gameState, uint32_t& buttonHold, Ha
+     prev_sample = inputTime;
+ }
+ 
++#ifndef _WIN32
++static float s_yLoadedL = 0.0f, s_yLoadedR = 0.0f;
++#endif
+ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+     hCPU->instructionPointer = hCPU->sprNew.LR;
+ 
+@@ -968,10 +978,8 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+     if (!renderer) {
+         return;
+     }
++    // may be null: the ImGui overlay isn't created on Linux yet, but XR input must still work
+     auto* imguiOverlay = renderer->m_imguiOverlay.get();
+-    if (!imguiOverlay) {
+-        return;
+-    }
+ 
+     // todo: revert this to unblock gamepad input
+     readMemory(vpadStatusOffset, &vpadStatus);
+@@ -999,6 +1007,37 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+ 
+     // fetch input state
+     OpenXR::InputState inputs = VRManager::instance().XR->m_input.load();
++#ifndef _WIN32
++    // Deliver each tap counted by the pose thread exactly once (its own ShortPress flag usually gets
++    // cleared by a later poll before the game reads it).
++    {
++        static std::array<uint32_t, OpenXR::TAP_COUNT> s_tapsSeen = [] {
++            std::array<uint32_t, OpenXR::TAP_COUNT> seen{};
++            for (int i = 0; i < OpenXR::TAP_COUNT; i++) seen[i] = VRManager::instance().XR->m_tapCount[i].load(std::memory_order_acquire);
++            return seen;
++        }();
++        auto tapStates = OpenXR::TapStates(inputs);
++        for (int i = 0; i < OpenXR::TAP_COUNT; i++) {
++            uint32_t count = VRManager::instance().XR->m_tapCount[i].load(std::memory_order_acquire);
++            if (count != s_tapsSeen[i]) {
++                s_tapsSeen[i] = count;
++                tapStates[i]->lastEvent = ButtonState::Event::ShortPress;
++            }
++            else if (tapStates[i]->lastEvent == ButtonState::Event::ShortPress) {
++                tapStates[i]->lastEvent = ButtonState::Event::None;
++            }
++        }
++    }
++    const bool modMenuActedUponLoaded = inputs.shared.modMenuState.longFired_actedUpon;
++    s_yLoadedL = inputs.shared.poseLocation[0].pose.position.y;
++    s_yLoadedR = inputs.shared.poseLocation[1].pose.position.y;
++    if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG")) {
++        static uint64_t s_injectDiagCount = 0;
++        if ((s_injectDiagCount++ % 180) == 0) {
++            Log::print<INFO>("[InjectDiag] calls={} in_game={} menuOpen={} vpadHold={:08X} inputTime={}", s_injectDiagCount, inputs.shared.in_game, VRManager::instance().XR->m_isMenuOpen.load(), vpadStatus.hold.getLE(), inputs.shared.inputTime);
++        }
++    }
++#endif
+     inputs.inGame.drop_weapon[0] = inputs.inGame.drop_weapon[1] = false;
+ 
+     float dt = (float)(inputs.shared.inputTime - prev_sample) / 1000000000.0f;
+@@ -1014,6 +1053,14 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+     // fetching stick inputs
+     XrActionStateVector2f& leftStickSource = gameState.in_game ? inputs.inGame.move : inputs.inMenu.navigate;
+     XrActionStateVector2f& rightStickSource = gameState.in_game ? inputs.inGame.camera : inputs.inMenu.scroll;
++#ifndef _WIN32
++    // headless testing aid: BETTERVR_DEBUG_AUTOTURN=<x> holds the camera stick sideways during gameplay
++    static const float s_autoTurn = [] { const char* e = std::getenv("BETTERVR_DEBUG_AUTOTURN"); return e ? strtof(e, nullptr) : 0.0f; }();
++    if (s_autoTurn != 0.0f && gameState.in_game) {
++        rightStickSource.isActive = XR_TRUE;
++        rightStickSource.currentState.x = s_autoTurn;
++    }
++#endif
+ 
+     // Apply deadzone
+     float stickDeadzone = GetSettings().stickDeadzone;
+@@ -1062,7 +1109,8 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+                 newXRBtnHold |= VPAD_BUTTON_PLUS;
+                 gameState.map_open = false;
+             }
+-            if (inputs.shared.inventory_mapState.lastEvent == ButtonState::Event::LongPress) {
++            if (inputs.shared.inventory_mapState.lastEvent == ButtonState::Event::LongPress
++                || inputs.inGame.mapState.lastEvent == ButtonState::Event::ShortPress) {
+                 newXRBtnHold |= VPAD_BUTTON_MINUS;
+                 gameState.map_open = true;
+             }
+@@ -1134,6 +1182,15 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+ 
+     // calculate new hold, trigger and release
+     uint32_t combinedHold = (vpadStatus.hold.getLE() | (newXRBtnHold | newXRStickHold));
++#ifndef _WIN32
++    // headless testing aid: BETTERVR_DEBUG_AUTOPRESS_A=1 taps A (200ms every 2s) while in menus, to get past the
++    // title screen and load the save without anyone wearing the headset
++    if (!gameState.in_game && std::getenv("BETTERVR_DEBUG_AUTOPRESS_A")) {
++        const auto phase = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() % 2000;
++        if (phase < 200)
++            combinedHold |= VPAD_BUTTON_A;
++    }
++#endif
+     vpadStatus.hold = combinedHold;
+     vpadStatus.trig = (combinedHold & ~oldCombinedHold);
+     vpadStatus.release = (~combinedHold & oldCombinedHold);
+@@ -1159,7 +1216,29 @@ void CemuHooks::hook_InjectXRInput(PPCInterpreter_t* hCPU) {
+     updatePreviousValues(gameState, newXRBtnHold, leftGesture, rightGesture, inputs.shared.inputTime);
+ 
+     VRManager::instance().XR->m_gameState.store(gameState);
++#ifndef _WIN32
++    if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG")) {
++        static uint64_t s_yDiagCount = 0;
++        if ((s_yDiagCount++ % 120) == 0) {
++            OpenXR::InputState fresh = VRManager::instance().XR->m_input.load();
++            Log::print<INFO>("[YDiag] xr={} &m_input={} sizeof={}", (void*)VRManager::instance().XR.get(), (void*)&VRManager::instance().XR->m_input, sizeof(OpenXR::InputState));
++            Log::print<INFO>("[YDiag] inject: loadedY={:.2f}/{:.2f} storingY={:.2f}/{:.2f} freshY={:.2f}/{:.2f} loadedT={} freshT={}",
++                s_yLoadedL, s_yLoadedR, inputs.shared.poseLocation[0].pose.position.y, inputs.shared.poseLocation[1].pose.position.y,
++                fresh.shared.poseLocation[0].pose.position.y, fresh.shared.poseLocation[1].pose.position.y, inputs.shared.inputTime, fresh.shared.inputTime);
++        }
++    }
++#endif
++#ifndef _WIN32
++    // Only write back what this hook owns: storing the whole snapshot would rewind the button edges
++    // the pose thread tracked since our load() and drop taps.
++    VRManager::instance().XR->m_input.update([&](OpenXR::InputState& current) {
++        current.inGame.drop_weapon = inputs.inGame.drop_weapon;
++        if (modMenuActedUponLoaded && !inputs.shared.modMenuState.longFired_actedUpon)
++            current.shared.modMenuState.longFired_actedUpon = false;
++    });
++#else
+     VRManager::instance().XR->m_input.store(inputs);
++#endif
+ }
+ 
+ 
+diff --git a/src/hooking/framebuffer.cpp b/src/hooking/framebuffer.cpp
+index d5647f6..9e33899 100644
+--- a/src/hooking/framebuffer.cpp
++++ b/src/hooking/framebuffer.cpp
+@@ -90,6 +90,16 @@ void VkDeviceOverrides::CmdClearColorImage(const vkroots::VkCommandBufferDispatc
+         side = OpenXR::EyeSide::RIGHT;
+     }
+ 
++#ifndef _WIN32
++    if (LinuxCaptureDiagnosticsEnabled()) {
++        static std::atomic<int> s_clearDiagCount = 0;
++        int n = s_clearDiagCount++;
++        if (n < 80 || (side != (OpenXR::EyeSide)-1 && n < 400)) {
++            Log::print<INFO>("[ClearDiag #{}] img={} rgba=({:.6f},{:.6f},{:.6f},{:.6f}) side={}", n, (void*)image, pColor->float32[0], pColor->float32[1], pColor->float32[2], pColor->float32[3], (int)side);
++        }
++    }
++#endif
++
+     if (!VRManager::instance().VK) {
+         auto* dispatch = pDispatch.pDeviceDispatch;
+         VRManager::instance().Init(dispatch->pPhysicalDeviceDispatch->pInstanceDispatch->Instance, dispatch->PhysicalDevice, dispatch->Device);
+diff --git a/src/hooking/settings.cpp b/src/hooking/settings.cpp
+index d081fbb..05ef2db 100644
+--- a/src/hooking/settings.cpp
++++ b/src/hooking/settings.cpp
+@@ -198,6 +198,16 @@ void CemuHooks::hook_OSReportToConsole(PPCInterpreter_t* hCPU) {
+     }
+     if (str[0] != '\0') {
+         Log::print<PPC>(str);
++#ifndef _WIN32
++        static std::atomic<int> s_ppcDiagCount = 0;
++        if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG") && !std::strstr(str, "callRec") && s_ppcDiagCount++ < 300) {
++            Log::print<INFO>("[PPCDiag] {}", str);
++        }
++        extern std::atomic<int> g_ppcTraceFrames;
++        if (g_ppcTraceFrames.load() > 0) {
++            Log::print<INFO>("[PPCTrace] {}", str); // (watch values are printed by the camera markers)
++        }
++#endif
+     }
+ }
+ 
+@@ -209,6 +219,32 @@ void CemuHooks::hook_RouteActorJob(PPCInterpreter_t* hCPU) {
+     uint32_t jobName = hCPU->gpr[4];
+     uint32_t side = hCPU->gpr[5]; // 0 = left, 1 = right
+ 
++    extern std::atomic<int> g_ppcTraceFrames;
++    if (g_ppcTraceFrames.load() > 0) {
++        static std::mutex s_m;
++        static std::map<std::string, int> s_counts;
++        static int s_frame = -1;
++        std::lock_guard l(s_m);
++        s_counts[std::string((char*)(s_memoryBaseAddress + jobName)) + (side ? "/R" : "/L")]++;
++        if (g_ppcTraceFrames.load() != s_frame) {
++            s_frame = g_ppcTraceFrames.load();
++            std::string out;
++            for (auto& [k, c] : s_counts) out += std::format(" {}={}", k, c);
++            Log::print<INFO>("[PPCTrace] routeActorJob counts so far:{}", out);
++        }
++    }
++
++    // Mono frames have no right eye pass, so every job runs normally in the single pass, like the unmodified game.
++    if (IsMonoFrame() && !MonoKeepsRightCalc()) {
++        hCPU->gpr[3] = 0;
++        return;
++    }
++    // mono frames that keep the right eye's calcDraw: run every job once, in the left eye's pass
++    if (IsMonoFrame()) {
++        hCPU->gpr[3] = side == 0 ? 0 : 1;
++        return;
++    }
++
+     std::string jobNameStr = std::string((char*)(s_memoryBaseAddress + jobName));
+ 
+     ActorWiiU actor;
+diff --git a/src/hooking/skeleton.cpp b/src/hooking/skeleton.cpp
+index 105161a..80e50ed 100644
+--- a/src/hooking/skeleton.cpp
++++ b/src/hooking/skeleton.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include <set>
+ 
+ #include "instance.h"
+ #include "cemu_hooks.h"
+@@ -365,6 +366,21 @@ void CemuHooks::hook_ModifyBoneMatrix(PPCInterpreter_t* hCPU) {
+     }
+ 
+     int boneIndex = s_skeleton.GetBoneIndex(boneName);
++#ifndef _WIN32
++    if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG")) {
++        static std::set<std::string> s_seenBones;
++        static uint64_t s_boneDiagCount = 0;
++        if (s_seenBones.insert(boneName).second)
++            Log::print<INFO>("[BoneDiag] hooked bone '{}' idx={}", boneName, boneIndex);
++        if (boneName == "Wrist_R" && (s_boneDiagCount++ % 120) == 0) {
++            glm::vec3 camP = glm::vec3(cameraMtx[3]);
++            glm::vec3 plP = glm::vec3(playerMtx4[3]);
++            Log::print<INFO>("[BoneDiag] rawR=({:.2f},{:.2f},{:.2f}) flags={:X} inputT={}", pose.pose.position.x, pose.pose.position.y, pose.pose.position.z, (uint64_t)pose.locationFlags, inputs.shared.inputTime);
++            Log::print<INFO>("[BoneDiag] ctrlR=({:.2f},{:.2f},{:.2f}) cam=({:.2f},{:.2f},{:.2f}) player=({:.2f},{:.2f},{:.2f}) cam-player.y={:.2f}",
++                controllerPos.x, controllerPos.y, controllerPos.z, camP.x, camP.y, camP.z, plP.x, plP.y, plP.z, camP.y - plP.y);
++        }
++    }
++#endif
+     if (boneIndex == -1)
+         return;
+ 
+@@ -443,6 +459,17 @@ void CemuHooks::hook_ModifyBoneMatrix(PPCInterpreter_t* hCPU) {
+ 
+             s_skeleton.SolveTwoBoneIK(arm1Index, arm2Index, wristIndex, targetPos, poleDir, isLeft ? 1.0f : -1.0f);
+             calculatedLocalMat = s_skeleton.GetBone(boneIndex)->localMatrix;
++#ifndef _WIN32
++            if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG") && boneName == "Arm_1_R") {
++                static uint64_t s_ikDiagCount = 0;
++                if ((s_ikDiagCount++ % 120) == 0) {
++                    glm::vec3 shoulder = glm::vec3(s_skeleton.GetBone(arm1Index)->worldMatrix[3]);
++                    glm::vec3 wrist = glm::vec3(s_skeleton.GetBone(wristIndex)->worldMatrix[3]);
++                    Log::print<INFO>("[IKDiag] targetModel=({:.2f},{:.2f},{:.2f}) shoulderModel=({:.2f},{:.2f},{:.2f}) wristModel=({:.2f},{:.2f},{:.2f})",
++                        targetPos.x, targetPos.y, targetPos.z, shoulder.x, shoulder.y, shoulder.z, wrist.x, wrist.y, wrist.z);
++                }
++            }
++#endif
+         }
+     }
+ 
+diff --git a/src/rendering/openxr.cpp b/src/rendering/openxr.cpp
+index 3d32b1a..3cb4ec3 100644
+--- a/src/rendering/openxr.cpp
++++ b/src/rendering/openxr.cpp
+@@ -53,6 +53,12 @@ OpenXR::OpenXR() {
+             timeConvSupported = true;
+         }
+ #endif
++        else if (strcmp(extensionProperties.extensionName, "XR_VALVE_frame_controller_interaction") == 0) {
++            m_frameControllerSupported = true;
++        }
++        else if (strcmp(extensionProperties.extensionName, "XR_VALVE_app_space_delta_pose") == 0) {
++            m_appSpaceDeltaPoseSupported = true;
++        }
+         else if (strcmp(extensionProperties.extensionName, XR_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+ #ifdef _DEBUG
+             debugUtilsSupported = Log::isLogTypeEnabled<XR_DEBUGUTILS>();
+@@ -88,6 +94,8 @@ OpenXR::OpenXR() {
+     std::vector<const char*> enabledExtensions = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME };
+ #endif
+     if (debugUtilsSupported) enabledExtensions.emplace_back(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
++    if (m_frameControllerSupported) enabledExtensions.emplace_back("XR_VALVE_frame_controller_interaction");
++    if (m_appSpaceDeltaPoseSupported) enabledExtensions.emplace_back("XR_VALVE_app_space_delta_pose");
+ 
+     XrInstanceCreateInfo xrInstanceCreateInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
+     xrInstanceCreateInfo.createFlags = 0;
+@@ -121,6 +129,10 @@ OpenXR::OpenXR() {
+     }
+ #else
+     xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsRequirementsKHR", (PFN_xrVoidFunction*)&func_xrGetVulkanGraphicsRequirementsKHR);
++    if (m_appSpaceDeltaPoseSupported) {
++        xrGetInstanceProcAddr(m_instance, "xrSetAppSpaceDeltaPoseVALVE", &m_setAppSpaceDeltaPoseVALVE);
++        Log::print<INFO>("XR_VALVE_app_space_delta_pose: {}", m_setAppSpaceDeltaPoseVALVE ? "enabled" : "missing entry point");
++    }
+     xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction*)&func_xrGetVulkanGraphicsDeviceKHR);
+ #endif
+     if (debugUtilsSupported) {
+@@ -221,6 +233,11 @@ OpenXR::~OpenXR() {
+         xrDestroySpace(m_stageSpace);
+     }
+ 
++    if (m_hudStageSpace != XR_NULL_HANDLE) {
++        xrDestroySpace(m_hudStageSpace);
++        m_hudStageSpace = XR_NULL_HANDLE;
++    }
++
+     if (m_session != XR_NULL_HANDLE) {
+         xrDestroySession(m_session);
+     }
+@@ -264,6 +281,9 @@ void OpenXR::CreateSession(const void* graphicsBinding, const char* failureMessa
+     stageSpaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+     stageSpaceCreateInfo.poseInReferenceSpace = s_xrIdentityPose;
+     checkXRResult(xrCreateReferenceSpace(m_session, &stageSpaceCreateInfo, &m_stageSpace), "Failed to create reference space for stage!");
++    if (XR_FAILED(xrCreateReferenceSpace(m_session, &stageSpaceCreateInfo, &m_hudStageSpace))) {
++        m_hudStageSpace = XR_NULL_HANDLE;
++    }
+ 
+     XrReferenceSpaceCreateInfo headSpaceCreateInfo = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+     headSpaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+@@ -309,6 +329,7 @@ void OpenXR::CreateActions() {
+ 
+         createAction(m_gameplayActionSet, "crouch_scope", "Crouch (Quick press) - Open Scope (Long press)", XR_ACTION_TYPE_BOOLEAN_INPUT, m_crouch_scopeAction);
+         createAction(m_gameplayActionSet, "ingame_inventory_map", "Open Inventory (Quick press) - Open Map (Long press)", XR_ACTION_TYPE_BOOLEAN_INPUT, m_inGame_inventory_mapAction);
++        createAction(m_gameplayActionSet, "ingame_map", "Open Map", XR_ACTION_TYPE_BOOLEAN_INPUT, m_inGame_mapAction);
+ 
+         createAction(m_gameplayActionSet, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, m_rumbleAction);
+     }
+@@ -376,8 +397,8 @@ void OpenXR::CreateActions() {
+ 
+             XrActionSuggestedBinding{ .action = m_grab_interactAction, .binding = GetXRPath("/user/hand/left/input/squeeze/value") },
+             XrActionSuggestedBinding{ .action = m_grab_interactAction, .binding = GetXRPath("/user/hand/right/input/squeeze/value") },
+-            XrActionSuggestedBinding{ .action = m_jumpAction, .binding = GetXRPath("/user/hand/right/input/b/click") },
+-            XrActionSuggestedBinding{ .action = m_run_interactAction, .binding = GetXRPath("/user/hand/right/input/a/click") },
++            XrActionSuggestedBinding{ .action = m_jumpAction, .binding = GetXRPath("/user/hand/right/input/a/click") },
++            XrActionSuggestedBinding{ .action = m_run_interactAction, .binding = GetXRPath("/user/hand/right/input/b/click") },
+             XrActionSuggestedBinding{ .action = m_useRune_dpadMenu_Action, .binding = GetXRPath("/user/hand/left/input/y/click") },
+             XrActionSuggestedBinding{ .action = m_inGame_modMenuAction, .binding = GetXRPath("/user/hand/left/input/x/click") },
+ 
+@@ -397,8 +418,8 @@ void OpenXR::CreateActions() {
+             XrActionSuggestedBinding{ .action = m_inMenuAimPoseAction, .binding = GetXRPath("/user/hand/right/input/aim/pose") },
+             XrActionSuggestedBinding{ .action = m_scrollAction, .binding = GetXRPath("/user/hand/right/input/thumbstick") },
+             XrActionSuggestedBinding{ .action = m_navigateAction, .binding = GetXRPath("/user/hand/left/input/thumbstick") },
+-            XrActionSuggestedBinding{ .action = m_selectAction, .binding = GetXRPath("/user/hand/right/input/a/click") },
+-            XrActionSuggestedBinding{ .action = m_backAction, .binding = GetXRPath("/user/hand/right/input/b/click") },
++            XrActionSuggestedBinding{ .action = m_selectAction, .binding = GetXRPath("/user/hand/right/input/b/click") },
++            XrActionSuggestedBinding{ .action = m_backAction, .binding = GetXRPath("/user/hand/right/input/a/click") },
+             XrActionSuggestedBinding{ .action = m_sortAction, .binding = GetXRPath("/user/hand/left/input/y/click") },
+             XrActionSuggestedBinding{ .action = m_holdAction, .binding = GetXRPath("/user/hand/left/input/x/click") },
+             XrActionSuggestedBinding{ .action = m_leftGripAction, .binding = GetXRPath("/user/hand/left/input/squeeze/value") },
+@@ -466,6 +487,73 @@ void OpenXR::CreateActions() {
+         checkXRResult(xrSuggestInteractionProfileBindings(m_instance, &suggestedBindingsInfo), "Failed to suggest Valve Index Controller Profile bindings!");
+     }
+ 
++    // Steam Frame controllers: right has A/B/X/Y + menu (hamburger), left has a D-pad + view. Without a
++    // native profile SteamVR emulates Touch, which leaves menu and view unbound. Menu acts as Wii U plus
++    // (tap: inventory, hold: map, like the right stick click), view as Wii U minus (map).
++    if (m_frameControllerSupported) {
++        std::array suggestedBindings = {
++            // === gameplay suggestions ===
++            XrActionSuggestedBinding{ .action = m_inGameGripPoseAction, .binding = GetXRPath("/user/hand/left/input/grip/pose") },
++            XrActionSuggestedBinding{ .action = m_inGameGripPoseAction, .binding = GetXRPath("/user/hand/right/input/grip/pose") },
++            XrActionSuggestedBinding{ .action = m_inGameAimPoseAction, .binding = GetXRPath("/user/hand/left/input/aim/pose") },
++            XrActionSuggestedBinding{ .action = m_inGameAimPoseAction, .binding = GetXRPath("/user/hand/right/input/aim/pose") },
++            XrActionSuggestedBinding{ .action = m_moveAction, .binding = GetXRPath("/user/hand/left/input/thumbstick") },
++            XrActionSuggestedBinding{ .action = m_cameraAction, .binding = GetXRPath("/user/hand/right/input/thumbstick") },
++
++            XrActionSuggestedBinding{ .action = m_grab_interactAction, .binding = GetXRPath("/user/hand/left/input/squeeze/value") },
++            XrActionSuggestedBinding{ .action = m_grab_interactAction, .binding = GetXRPath("/user/hand/right/input/squeeze/value") },
++            XrActionSuggestedBinding{ .action = m_jumpAction, .binding = GetXRPath("/user/hand/right/input/a/click") },
++            XrActionSuggestedBinding{ .action = m_run_interactAction, .binding = GetXRPath("/user/hand/right/input/b/click") },
++            XrActionSuggestedBinding{ .action = m_run_interactAction, .binding = GetXRPath("/user/hand/right/input/x/click") },
++            XrActionSuggestedBinding{ .action = m_run_interactAction, .binding = GetXRPath("/user/hand/right/input/y/click") },
++            XrActionSuggestedBinding{ .action = m_useRune_dpadMenu_Action, .binding = GetXRPath("/user/hand/left/input/dpad_up/click") },
++            XrActionSuggestedBinding{ .action = m_useRune_dpadMenu_Action, .binding = GetXRPath("/user/hand/left/input/dpad_left/click") },
++            XrActionSuggestedBinding{ .action = m_useRune_dpadMenu_Action, .binding = GetXRPath("/user/hand/left/input/dpad_right/click") },
++            XrActionSuggestedBinding{ .action = m_inGame_modMenuAction, .binding = GetXRPath("/user/hand/left/input/dpad_down/click") },
++
++            XrActionSuggestedBinding{ .action = m_useLeftItemAction, .binding = GetXRPath("/user/hand/left/input/trigger/value") },
++            XrActionSuggestedBinding{ .action = m_useRightItemAction, .binding = GetXRPath("/user/hand/right/input/trigger/value") },
++
++            XrActionSuggestedBinding{ .action = m_crouch_scopeAction, .binding = GetXRPath("/user/hand/left/input/thumbstick/click") },
++            XrActionSuggestedBinding{ .action = m_inGame_inventory_mapAction, .binding = GetXRPath("/user/hand/right/input/thumbstick/click") },
++            XrActionSuggestedBinding{ .action = m_inGame_inventory_mapAction, .binding = GetXRPath("/user/hand/right/input/menu/click") },
++            XrActionSuggestedBinding{ .action = m_inGame_mapAction, .binding = GetXRPath("/user/hand/left/input/view/click") },
++
++            XrActionSuggestedBinding{ .action = m_rumbleAction, .binding = GetXRPath("/user/hand/left/output/haptic") },
++            XrActionSuggestedBinding{ .action = m_rumbleAction, .binding = GetXRPath("/user/hand/right/output/haptic") },
++
++            // === menu suggestions ===
++            XrActionSuggestedBinding{ .action = m_inMenuGripPoseAction, .binding = GetXRPath("/user/hand/left/input/grip/pose") },
++            XrActionSuggestedBinding{ .action = m_inMenuGripPoseAction, .binding = GetXRPath("/user/hand/right/input/grip/pose") },
++            XrActionSuggestedBinding{ .action = m_inMenuAimPoseAction, .binding = GetXRPath("/user/hand/left/input/aim/pose") },
++            XrActionSuggestedBinding{ .action = m_inMenuAimPoseAction, .binding = GetXRPath("/user/hand/right/input/aim/pose") },
++            XrActionSuggestedBinding{ .action = m_scrollAction, .binding = GetXRPath("/user/hand/right/input/thumbstick") },
++            XrActionSuggestedBinding{ .action = m_navigateAction, .binding = GetXRPath("/user/hand/left/input/thumbstick") },
++            XrActionSuggestedBinding{ .action = m_selectAction, .binding = GetXRPath("/user/hand/right/input/b/click") },
++            XrActionSuggestedBinding{ .action = m_selectAction, .binding = GetXRPath("/user/hand/right/input/x/click") },
++            XrActionSuggestedBinding{ .action = m_selectAction, .binding = GetXRPath("/user/hand/right/input/y/click") },
++            XrActionSuggestedBinding{ .action = m_backAction, .binding = GetXRPath("/user/hand/right/input/a/click") },
++            XrActionSuggestedBinding{ .action = m_sortAction, .binding = GetXRPath("/user/hand/left/input/dpad_up/click") },
++            XrActionSuggestedBinding{ .action = m_sortAction, .binding = GetXRPath("/user/hand/left/input/dpad_left/click") },
++            XrActionSuggestedBinding{ .action = m_sortAction, .binding = GetXRPath("/user/hand/left/input/dpad_right/click") },
++            XrActionSuggestedBinding{ .action = m_holdAction, .binding = GetXRPath("/user/hand/left/input/dpad_down/click") },
++            XrActionSuggestedBinding{ .action = m_leftGripAction, .binding = GetXRPath("/user/hand/left/input/squeeze/value") },
++            XrActionSuggestedBinding{ .action = m_rightGripAction, .binding = GetXRPath("/user/hand/right/input/squeeze/value") },
++            XrActionSuggestedBinding{ .action = m_leftTriggerAction, .binding = GetXRPath("/user/hand/left/input/trigger/value") },
++            XrActionSuggestedBinding{ .action = m_rightTriggerAction, .binding = GetXRPath("/user/hand/right/input/trigger/value") },
++            XrActionSuggestedBinding{ .action = m_inMenu_inventory_mapAction, .binding = GetXRPath("/user/hand/right/input/thumbstick/click") },
++            XrActionSuggestedBinding{ .action = m_inMenu_inventory_mapAction, .binding = GetXRPath("/user/hand/right/input/menu/click") },
++            XrActionSuggestedBinding{ .action = m_inMenu_inventory_mapAction, .binding = GetXRPath("/user/hand/left/input/view/click") },
++            XrActionSuggestedBinding{ .action = m_inMenu_modMenuAction, .binding = GetXRPath("/user/hand/left/input/dpad_down/click") },
++        };
++        XrInteractionProfileSuggestedBinding suggestedBindingsInfo = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
++        suggestedBindingsInfo.interactionProfile = GetXRPath("/interaction_profiles/valve/frame_controller");
++        suggestedBindingsInfo.countSuggestedBindings = (uint32_t)suggestedBindings.size();
++        suggestedBindingsInfo.suggestedBindings = suggestedBindings.data();
++        XrResult result = xrSuggestInteractionProfileBindings(m_instance, &suggestedBindingsInfo);
++        Log::print<INFO>("Steam Frame controller bindings suggested: {}", XR_SUCCEEDED(result) ? "ok" : "failed");
++    }
++
+     XrSessionActionSetsAttachInfo attachInfo = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+     std::array actionSets = { m_gameplayActionSet, m_menuActionSet };
+     attachInfo.countActionSets = (uint32_t)actionSets.size();
+@@ -543,6 +631,11 @@ void CheckButtonState(bool buttonPressed, ButtonState& buttonState) {
+     buttonState.wasDownLastFrame = down;
+ }
+ 
++#ifndef _WIN32
++static uint64_t s_poseInactiveCount = 0;
++static uint64_t s_poseInvalidCount = 0;
++#endif
++
+ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTime, glm::fquat controllerRotation, bool inMenu) {
+     BetterVRProfiler::Scope profile(BetterVRProfiler::Section::XRUpdateActions);
+ 
+@@ -565,8 +658,15 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
+             poseState = { XR_TYPE_ACTION_STATE_POSE };
+             checkXRResult(xrGetActionStatePose(m_session, &getPoseInfo, &poseState), errorContext);
+ 
++            // keep the previous valid pose: a momentary miss (e.g. a stale prediction time at low
++            // game FPS) would otherwise drop the hand to the stage origin, i.e. the floor
++            const XrSpaceLocation lastLocation = outLocation;
+             outLocation = { XR_TYPE_SPACE_LOCATION };
+             if (!poseState.isActive) {
++#ifndef _WIN32
++                outLocation = lastLocation;
++                s_poseInactiveCount++;
++#endif
+                 if (outVelocity != nullptr) {
+                     *outVelocity = { XR_TYPE_SPACE_VELOCITY };
+                 }
+@@ -582,6 +682,12 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
+             }
+ 
+             checkXRResult(xrLocateSpace(handSpace, m_stageSpace, predictedFrameTime, &spaceLocation), "Failed to get location from controllers!");
++#ifndef _WIN32
++            if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0 || (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
++                s_poseInvalidCount++;
++                outLocation = lastLocation;
++            }
++#endif
+             if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 && (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
+                 outLocation = spaceLocation;
+ 
+@@ -781,6 +887,15 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
+             CheckButtonState(buttonPressed, useRuneButtonState);
+         }
+ 
++        XrActionStateGetInfo getMapInfo = { XR_TYPE_ACTION_STATE_GET_INFO };
++        getMapInfo.action = m_inGame_mapAction;
++        getMapInfo.subactionPath = XR_NULL_PATH;
++        newState.inGame.map = { XR_TYPE_ACTION_STATE_BOOLEAN };
++        checkXRResult(xrGetActionStateBoolean(m_session, &getMapInfo, &newState.inGame.map), "Failed to get map action value!");
++        if (newState.inGame.map.isActive == XR_TRUE) {
++            CheckButtonState(newState.inGame.map.currentState == XR_TRUE, newState.inGame.mapState);
++        }
++
+         XrActionStateGetInfo getUseRightItemInfo = { XR_TYPE_ACTION_STATE_GET_INFO };
+         getUseRightItemInfo.action = m_useRightItemAction;
+         getUseRightItemInfo.subactionPath = XR_NULL_PATH;
+@@ -793,7 +908,51 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
+         newState.inGame.useLeftItem = { XR_TYPE_ACTION_STATE_BOOLEAN };
+         checkXRResult(xrGetActionStateBoolean(m_session, &getUseLeftItemInfo, &newState.inGame.useLeftItem), "Failed to get useLeftItem action value!");
+     }
++#ifndef _WIN32
++    if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG")) {
++        static uint64_t s_inputDiagCount = 0;
++        if ((s_inputDiagCount++ % 180) == 0) {
++            Log::print<INFO>("[InputDiag] syncs={} sessionState={} inMenu={} select(active={},down={}) back(active={},down={}) navigate(active={},x={:.2f},y={:.2f}) jump(active={},down={})",
++                s_inputDiagCount, (int)m_currentSessionState.load(), inMenu,
++                newState.inMenu.select.isActive, newState.inMenu.select.currentState,
++                newState.inMenu.back.isActive, newState.inMenu.back.currentState,
++                newState.inMenu.navigate.isActive, newState.inMenu.navigate.currentState.x, newState.inMenu.navigate.currentState.y,
++                newState.inGame.jump_cancel.isActive, newState.inGame.jump_cancel.currentState);
++            XrSpaceLocation headLoc = { XR_TYPE_SPACE_LOCATION };
++            xrLocateSpace(m_headSpace, m_stageSpace, predictedFrameTime, &headLoc);
++            const auto& l = newState.shared.poseLocation[0].pose.position;
++            const auto& r = newState.shared.poseLocation[1].pose.position;
++            Log::print<INFO>("[PoseDiag] inactive={} invalid={} predictedTime={}", s_poseInactiveCount, s_poseInvalidCount, predictedFrameTime);
++            Log::print<INFO>("[PoseDiag] head=({:.2f},{:.2f},{:.2f}) flags={:X} left=({:.2f},{:.2f},{:.2f}) right=({:.2f},{:.2f},{:.2f}) handFlags={:X}/{:X}",
++                headLoc.pose.position.x, headLoc.pose.position.y, headLoc.pose.position.z, headLoc.locationFlags,
++                l.x, l.y, l.z, r.x, r.y, r.z, newState.shared.poseLocation[0].locationFlags, newState.shared.poseLocation[1].locationFlags);
++        }
++    }
++#endif
++#ifndef _WIN32
++    for (int i = 0; i < TAP_COUNT; i++) {
++        if (TapStates(newState)[i]->lastEvent == ButtonState::Event::ShortPress)
++            m_tapCount[i].fetch_add(1, std::memory_order_release);
++    }
++    // drop_weapon is written by the game hook, possibly since our load() above; keep its value
++    this->m_input.update([&](InputState& current) {
++        newState.inGame.drop_weapon = current.inGame.drop_weapon;
++        current = newState;
++    });
++#else
+     this->m_input.store(newState);
++#endif
++#ifndef _WIN32
++    if (std::getenv("BETTERVR_LINUX_CAPTURE_DIAG")) {
++        static uint64_t s_storeDiagCount = 0;
++        if ((s_storeDiagCount++ % 120) == 0) {
++            InputState back = this->m_input.load();
++            Log::print<INFO>("[StoreDiag] this={} &m_input={} storedY={:.2f}/{:.2f} readBackY={:.2f}/{:.2f} T={} backT={} sizeof={}",
++                (void*)this, (void*)&this->m_input, newState.shared.poseLocation[0].pose.position.y, newState.shared.poseLocation[1].pose.position.y,
++                back.shared.poseLocation[0].pose.position.y, back.shared.poseLocation[1].pose.position.y, newState.shared.inputTime, back.shared.inputTime, sizeof(InputState));
++        }
++    }
++#endif
+     return newState;
+ }
+ 
+@@ -829,6 +988,7 @@ void OpenXR::ProcessEvents() {
+ #ifndef _WIN32
+         // Linux submit thread reads this to gate xrEndFrame; Windows does not use it.
+         m_currentSessionState.store(stateChangedEvent->state, std::memory_order_release);
++        Log::print<INFO>("OpenXR session state -> {} (4=visible, 5=focused)", (int)stateChangedEvent->state);
+ #endif
+         switch (stateChangedEvent->state) {
+             case XR_SESSION_STATE_IDLE:
+diff --git a/src/rendering/openxr.h b/src/rendering/openxr.h
+index 896437e..b47e606 100644
+--- a/src/rendering/openxr.h
++++ b/src/rendering/openxr.h
+@@ -1,6 +1,25 @@
+ #pragma once
+ 
+ #include "hooking/rumble.h"
++#include <mutex>
++
++// Mutex-guarded value with the load()/store() subset of std::atomic. GCC 13's std::atomic<T> for
++// large structs zeroed fields on store on aarch64 (hand pose y always read back as 0), so the big
++// input/game state structs use this instead.
++template <typename T>
++class LockedValue {
++public:
++    LockedValue() = default;
++    LockedValue(const T& value) : m_value(value) {}
++    T load() const { std::lock_guard lock(m_mutex); return m_value; }
++    void store(const T& value) { std::lock_guard lock(m_mutex); m_value = value; }
++    // read-modify-write under the lock, for merging fields owned by different threads
++    template <typename F>
++    void update(F&& fn) { std::lock_guard lock(m_mutex); fn(m_value); }
++private:
++    mutable std::mutex m_mutex;
++    T m_value{};
++};
+ 
+ class RND_Renderer;
+ 
+@@ -86,6 +105,8 @@ public:
+             ButtonState runState;
+             XrActionStateBoolean useRune_dpadMenu;
+             ButtonState useRune_runeMenuState;
++            XrActionStateBoolean map; // Steam Frame view button (Wii U minus)
++            ButtonState mapState;
+ 
+             XrActionStateBoolean useLeftItem;
+             XrActionStateBoolean useRightItem;
+@@ -111,7 +132,22 @@ public:
+             XrActionStateBoolean rightTrigger;
+         } inMenu;
+     };
+-    std::atomic<InputState> m_input = InputState{};
++    LockedValue<InputState> m_input = InputState{};
++    // XR_VALVE_app_space_delta_pose (SteamVR): xrSetAppSpaceDeltaPoseVALVE, see LinuxPublishAppSpaceDelta
++    PFN_xrVoidFunction m_setAppSpaceDeltaPoseVALVE = nullptr;
++    bool m_appSpaceDeltaPoseSupported = false;
++    XrSpace m_hudStageSpace = XR_NULL_HANDLE; // second STAGE handle so app-space delta pose (world reprojection) does not move the HUD
++    XrSpace GetHeadSpace() const { return m_headSpace; }
++#ifndef _WIN32
++    // Buttons with a quick-press action. UpdateActions runs on the pose thread several times per game
++    // frame and clears ShortPress on every poll, so it counts taps here for the game hook to deliver.
++    enum TapButton { TAP_INVENTORY_MAP, TAP_MOD_MENU, TAP_HOLD, TAP_CROUCH_SCOPE, TAP_RUN, TAP_USE_RUNE, TAP_MAP, TAP_COUNT };
++    static std::array<InputState::ButtonState*, TAP_COUNT> TapStates(InputState& s) {
++        return { &s.shared.inventory_mapState, &s.shared.modMenuState, &s.inMenu.holdState,
++                 &s.inGame.crouch_scopeState, &s.inGame.runState, &s.inGame.useRune_runeMenuState, &s.inGame.mapState };
++    }
++    std::array<std::atomic<uint32_t>, TAP_COUNT> m_tapCount{};
++#endif
+     std::atomic<glm::fquat> m_inputCameraRotation = glm::identity<glm::fquat>();
+ 
+     struct GameState {
+@@ -164,7 +200,7 @@ public:
+         int magnesis_forward_frames_interval = 0;
+         bool trigger_pressed_over_body_slot = false;
+     };
+-    std::atomic<GameState> m_gameState{};
++    LockedValue<GameState> m_gameState{};
+     std::atomic_bool m_isMenuOpen = false;
+     std::atomic_uint8_t m_currMenuTab = 0;
+     std::atomic_bool m_forceTabChange = false;
+@@ -243,6 +279,8 @@ private:
+ 
+     XrAction m_crouch_scopeAction = XR_NULL_HANDLE;
+     XrAction m_inGame_inventory_mapAction = XR_NULL_HANDLE;
++    XrAction m_inGame_mapAction = XR_NULL_HANDLE;
++    bool m_frameControllerSupported = false;
+ 
+     XrAction m_rumbleAction = XR_NULL_HANDLE;
+ 
+diff --git a/src/rendering/renderer_vulkan.cpp b/src/rendering/renderer_vulkan.cpp
+index 7d00990..9be26bb 100644
+--- a/src/rendering/renderer_vulkan.cpp
++++ b/src/rendering/renderer_vulkan.cpp
+@@ -11,6 +11,7 @@
+ #include <mutex>
+ #include <condition_variable>
+ 
++static bool LinuxMonoRender();
+ static bool LinuxEnvFlagEnabled(const char* name) {
+     const char* value = std::getenv(name);
+     if (value == nullptr || value[0] == '\0') return false;
+@@ -261,6 +262,8 @@ struct LinuxRenderState {
+             std::array<XrView, 2> renderViews = { XrView{ XR_TYPE_VIEW }, XrView{ XR_TYPE_VIEW } };
+             XrTime renderDisplayTime = 0;
+             bool hasRenderViews = false;
++            glm::mat4 cameraBase = glm::mat4(1.0f);
++            bool showingMenu = true;
+         };
+         std::mutex latestMutex;
+         LatestContent latest;
+@@ -661,6 +664,49 @@ RND_Renderer::~RND_Renderer() {
+     Log::print<INFO>("Linux RND_Renderer: Destroyed");
+ }
+ 
++// The Steam Frame reports a slightly different per-eye FOV on almost every xrLocateViews call
++// (+-1-2 degrees). The game renders with the FOV from one sample while the layer is submitted with
++// another, so the world visibly scales/warps from frame to frame. Latch the first FOV per eye and
++// use it everywhere; the runtime reprojects a fixed FOV correctly.
++// Overscan: render (and submit) a wider FOV than the display shows, so the compositor's reprojection
++// of a stale frame at low game FPS has image to show at the edges instead of black.
++// BETTERVR_LINUX_OVERSCAN=<tangent scale>, e.g. 1.15; 1 or unset disables it.
++static void LinuxOverscanViewFovs(std::array<XrView, 2>& views) {
++    static const float s_scale = [] {
++        const char* e = getenv("BETTERVR_LINUX_OVERSCAN");
++        float scale = e ? strtof(e, nullptr) : 1.0f;
++        if (!(scale >= 1.0f && scale <= 2.0f)) scale = 1.0f;
++        Log::print<INFO>("Linux FOV overscan: {:.2f}", scale);
++        return scale;
++    }();
++    if (s_scale == 1.0f) return;
++    for (XrView& view : views) {
++        view.fov.angleLeft = atanf(tanf(view.fov.angleLeft) * s_scale);
++        view.fov.angleRight = atanf(tanf(view.fov.angleRight) * s_scale);
++        view.fov.angleUp = atanf(tanf(view.fov.angleUp) * s_scale);
++        view.fov.angleDown = atanf(tanf(view.fov.angleDown) * s_scale);
++    }
++}
++
++static void LinuxStabilizeViewFovs(std::array<XrView, 2>& views) {
++    LinuxOverscanViewFovs(views);
++    static std::mutex s_fovMutex;
++    static std::array<std::optional<XrFovf>, 2> s_latchedFov;
++    // Opt-in: BETTERVR_LINUX_FOV_LATCH=1. Off by default; the unlatched FOV looked correct in testing.
++    static const bool s_enabled = [] { const char* e = getenv("BETTERVR_LINUX_FOV_LATCH"); return e && e[0] == '1'; }();
++    if (!s_enabled) return;
++    std::lock_guard<std::mutex> lock(s_fovMutex);
++    for (int eye = 0; eye < 2; eye++) {
++        if (!s_latchedFov[eye].has_value()) {
++            s_latchedFov[eye] = views[eye].fov;
++            Log::print<INFO>("Latched eye {} FOV: L={:.2f} R={:.2f} U={:.2f} D={:.2f}", eye,
++                glm::degrees(views[eye].fov.angleLeft), glm::degrees(views[eye].fov.angleRight),
++                glm::degrees(views[eye].fov.angleUp), glm::degrees(views[eye].fov.angleDown));
++        }
++        views[eye].fov = *s_latchedFov[eye];
++    }
++}
++
+ // Head-pose-sampling thread: runs at ~250 Hz, continuously calling xrLocateViews
+ // as a fallback source for submit-time composition. Only touches OpenXR read-only calls;
+ // never accesses the Vulkan queue. The OpenXR spec permits concurrent xrLocateViews
+@@ -714,6 +760,7 @@ static void PoseTrackingThreadMain(XrSession session, XrSpace stageSpace) {
+         if (XR_SUCCEEDED(r) && viewCount == 2 &&
+             (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
+             (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++            LinuxStabilizeViewFovs(views);
+             auto sampleWallTime = std::chrono::high_resolution_clock::now();
+             std::lock_guard<std::mutex> lock(s_linux->poseTracking.viewsMutex);
+             s_linux->poseTracking.latestRawViews = views;
+@@ -748,6 +795,109 @@ static void PoseTrackingThreadMain(XrSession session, XrSpace stageSpace) {
+ // Between Cemu pushes, the loop keeps running at native vsync, re-submitting
+ // the same content render pose and depth so SteamVR can reproject it to the
+ // current display pose. HUD remains late-latched to the freshest pose.
++// XR_VALVE_app_space_delta_pose has no public header. Layout and entry point from SteamVR's vrclient.so
++// (sxr_xrSetAppSpaceDeltaPoseVALVE validates type, the space's session and displayTime, and reads these offsets).
++struct XrAppSpaceDeltaPoseSetInfoVALVE {
++    XrStructureType type;
++    const void* next;
++    uint64_t flags; // bit 0: use the display time of the last xrWaitFrame instead of displayTime
++    XrSpace space;
++    XrTime displayTime;
++    XrPosef deltaPose;
++    float nearZ;
++    float farZ;
++};
++static_assert(offsetof(XrAppSpaceDeltaPoseSetInfoVALVE, space) == 24);
++static_assert(offsetof(XrAppSpaceDeltaPoseSetInfoVALVE, deltaPose) == 40);
++static_assert(offsetof(XrAppSpaceDeltaPoseSetInfoVALVE, nearZ) == 68 && offsetof(XrAppSpaceDeltaPoseSetInfoVALVE, farZ) == 72);
++constexpr XrStructureType XR_TYPE_APP_SPACE_DELTA_POSE_SET_INFO_VALVE = (XrStructureType)1000084000;
++typedef XrResult (XRAPI_PTR* PFN_xrSetAppSpaceDeltaPoseVALVE)(XrSession, const XrAppSpaceDeltaPoseSetInfoVALVE*);
++
++// Tells SteamVR how BotW's world moves relative to the stage (stick turning, walking), so the frames it reprojects
++// between BotW's ~20 fps follow that motion instead of freezing it. BotW only updates its camera when it renders,
++// so the motion is extrapolated from the last two rendered frames. BETTERVR_LINUX_DELTA_POSE=<scale>: 1 = on,
++// -1 = inverted convention, unset/0 = off.
++static void LinuxPublishAppSpaceDelta(XrSession session, XrSpace stageSpace, uint64_t contentSeq, XrTime contentTime, const glm::mat4& contentBase, bool showingMenu, XrTime displayTime) {
++    static const float s_scale = [] { const char* e = getenv("BETTERVR_LINUX_DELTA_POSE"); return e ? strtof(e, nullptr) : 0.0f; }();
++    auto setDelta = (PFN_xrSetAppSpaceDeltaPoseVALVE)VRManager::instance().XR->m_setAppSpaceDeltaPoseVALVE;
++    if (s_scale == 0.0f || setDelta == nullptr || stageSpace == XR_NULL_HANDLE) return;
++
++    // Motion per second of the base (stage -> world), smoothed over several rendered frames so
++    // uneven frame pacing and per-frame camera noise don't turn into jitter.
++    static glm::mat4 s_lastBase = glm::mat4(1.0f);
++    static XrTime s_lastTime = 0;
++    static uint64_t s_lastSeq = 0;
++    static glm::vec3 s_linVel = glm::vec3(0.0f);  // base-local units per second
++    static glm::vec3 s_angVel = glm::vec3(0.0f);  // base-local axis*angle per second
++    static XrTime s_prevDisplayTime = 0;
++    if (contentSeq != s_lastSeq && contentTime > s_lastTime) {
++        if (s_lastTime != 0 && !showingMenu) {
++            double dt = double(contentTime - s_lastTime) / 1e9;
++            glm::mat4 step = glm::inverse(s_lastBase) * contentBase;
++            glm::quat q = glm::normalize(glm::quat_cast(step));
++            if (q.w < 0.0f) q = -q;
++            float angle = 2.0f * std::acos(std::clamp(q.w, -1.0f, 1.0f));
++            glm::vec3 axis = glm::length(glm::vec3(q.x, q.y, q.z)) > 1e-6f ? glm::normalize(glm::vec3(q.x, q.y, q.z)) : glm::vec3(0.0f, 1.0f, 0.0f);
++            glm::vec3 lin = glm::vec3(step[3]);
++            bool cut = dt <= 0.0 || dt > 0.25 || angle > 0.6f || glm::length(lin) > 3.0f; // camera cut / teleport / hitch
++            if (cut) {
++                s_linVel = glm::vec3(0.0f);
++                s_angVel = glm::vec3(0.0f);
++            } else {
++                constexpr float k = 0.5f; // EMA weight of the newest frame
++                s_linVel = glm::mix(s_linVel, lin / float(dt), k);
++                s_angVel = glm::mix(s_angVel, axis * (angle / float(dt)), k);
++            }
++        } else {
++            s_linVel = glm::vec3(0.0f);
++            s_angVel = glm::vec3(0.0f);
++        }
++        s_lastSeq = contentSeq;
++        s_lastBase = contentBase;
++        s_lastTime = contentTime;
++    }
++    if (showingMenu) {
++        s_linVel = glm::vec3(0.0f);
++        s_angVel = glm::vec3(0.0f);
++    }
++
++    // base extrapolated to a display time, at the smoothed velocity, capped at 150 ms ahead
++    auto baseAt = [&](XrTime t) -> glm::mat4 {
++        float ahead = float(std::clamp(double(t - s_lastTime), 0.0, 150e6) / 1e9);
++        glm::vec3 w = s_angVel * ahead;
++        float a = glm::length(w);
++        glm::quat rot = a > 1e-7f ? glm::angleAxis(a, w / a) : glm::identity<glm::quat>();
++        return s_lastBase * (glm::translate(glm::mat4(1.0f), s_linVel * ahead) * glm::mat4_cast(rot));
++    };
++
++    if (s_prevDisplayTime != 0) {
++        // where stage-space content of the previous display frame ends up in this one
++        glm::mat4 delta = glm::inverse(baseAt(displayTime)) * baseAt(s_prevDisplayTime);
++        if (s_scale < 0.0f) delta = glm::inverse(delta);
++        glm::quat q = glm::quat_cast(delta);
++        float scale = std::abs(s_scale);
++        q = glm::slerp(glm::identity<glm::quat>(), q, scale);
++
++        XrAppSpaceDeltaPoseSetInfoVALVE info = {};
++        info.type = XR_TYPE_APP_SPACE_DELTA_POSE_SET_INFO_VALVE;
++        info.space = stageSpace;
++        info.displayTime = displayTime;
++        info.deltaPose.orientation = { q.x, q.y, q.z, q.w };
++        info.deltaPose.position = { delta[3].x * scale, delta[3].y * scale, delta[3].z * scale };
++        info.nearZ = GetSettings().GetZNear();
++        info.farZ = GetSettings().GetZFar();
++        XrResult r = setDelta(session, &info);
++        static int s_logs = 0;
++        static uint64_t s_calls = 0;
++        if (s_logs < 5 || (XR_FAILED(r) && s_logs < 20) || (s_linux->captureDiagnosticsEnabled && (++s_calls % 360) == 0)) {
++            s_logs++;
++            Log::print<INFO>("xrSetAppSpaceDeltaPoseVALVE: result={} delta pos=({:.3f},{:.3f},{:.3f}) rot=({:.4f},{:.4f},{:.4f},{:.4f})",
++                (int)r, info.deltaPose.position.x, info.deltaPose.position.y, info.deltaPose.position.z, q.x, q.y, q.z, q.w);
++        }
++    }
++    s_prevDisplayTime = displayTime;
++}
++
+ static void SubmitThreadMain(XrSession session, XrSpace stageSpace) {
+     Log::print<INFO>("Submit thread: started");
+     if (s_linux) s_linux->submit.alive.store(true, std::memory_order_release);
+@@ -834,6 +984,7 @@ static void SubmitThreadMain(XrSession session, XrSpace stageSpace) {
+             if (XR_SUCCEEDED(lr) && viewCount == 2 &&
+                 (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
+                 (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++                LinuxStabilizeViewFovs(views);
+                 {
+                     std::lock_guard<std::mutex> lock(s_linux->submit.pendingMutex);
+                     s_linux->submit.pendingViews = views;
+@@ -1132,6 +1283,7 @@ static void SubmitThreadMain(XrSession session, XrSpace stageSpace) {
+                 if (XR_SUCCEEDED(lateResult) && lateViewCount == 2 &&
+                     (lateViewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
+                     (lateViewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
++                    LinuxStabilizeViewFovs(submitViews);
+                     sampleTime = lateLocateStop;
+                     sampleTargetTime = currentFrameState.predictedDisplayTime;
+                     haveSubmitViews = true;
+@@ -1264,7 +1416,8 @@ static void SubmitThreadMain(XrSession session, XrSpace stageSpace) {
+                 glm::quat hudOri = glm::quatLookAt(forward, up);
+                 constexpr float aspectRatio = 16.0f / 9.0f;
+                 hudLayer.layerFlags = has3D ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0;
+-                hudLayer.space = stageSpace;
++                hudLayer.space = VRManager::instance().XR->m_hudStageSpace != XR_NULL_HANDLE
++                    ? VRManager::instance().XR->m_hudStageSpace : stageSpace;
+                 hudLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                 hudLayer.subImage.swapchain = s_linux->hudSwapchain.handle;
+                 hudLayer.subImage.imageRect.offset = { 0, 0 };
+@@ -1274,6 +1427,14 @@ static void SubmitThreadMain(XrSession session, XrSpace stageSpace) {
+                 };
+                 hudLayer.pose.orientation = ToXR(hudOri);
+                 hudLayer.pose.position = ToXR(hudPos);
++                // View-locked HUD: the compositor pins it to the head every display frame, so frame
++                // prediction error and app-space delta pose can't make menus swim. BETTERVR_LINUX_HUD_VIEWLOCK=0 restores stage placement.
++                static const bool s_hudViewLock = [] { const char* e = getenv("BETTERVR_LINUX_HUD_VIEWLOCK"); return !e || atoi(e) != 0; }();
++                if (s_hudViewLock && VRManager::instance().XR->GetHeadSpace() != XR_NULL_HANDLE) {
++                    hudLayer.space = VRManager::instance().XR->GetHeadSpace();
++                    hudLayer.pose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
++                    hudLayer.pose.position = { 0.0f, 0.0f, -HUD_DISTANCE };
++                }
+                 hudLayer.size = { aspectRatio * HUD_SIZE, 1.0f * HUD_SIZE };
+                 hudLayerReady = true;
+             }
+@@ -1313,6 +1474,8 @@ static void SubmitThreadMain(XrSession session, XrSpace stageSpace) {
+                 curIter, (int)sessState, stateOkForRender);
+         }
+ 
++        LinuxPublishAppSpaceDelta(session, stageSpace, latest.contentSeq, latest.renderDisplayTime, latest.cameraBase, latest.showingMenu, endInfo.displayTime);
++
+         auto xrEndStart = std::chrono::high_resolution_clock::now();
+         XrResult xrEndResult = xrEndFrame(session, &endInfo);
+         auto xrEndStop = std::chrono::high_resolution_clock::now();
+@@ -1508,6 +1671,8 @@ void RND_Renderer::EndFrame() {
+                         ? published3DPair.renderDisplayTime
+                         : currentViewsDisplayTime;
+                     s_linux->submit.latest.hasRenderViews = true;
++                    s_linux->submit.latest.cameraBase = CemuHooks::s_lastCameraMtx;
++                    s_linux->submit.latest.showingMenu = CemuHooks::IsShowingMenu();
+                     s_linux->submit.latest.eyeCopied[0] = published3DPair.eyeCopied[0];
+                     s_linux->submit.latest.eyeCopied[1] = published3DPair.eyeCopied[1];
+                     s_linux->submit.latest.depthCopied[0] = pairDepthCopied(0);
+@@ -1777,9 +1942,24 @@ void RND_Renderer::LinuxHandleDepthClear(OpenXR::EyeSide side,
+         LinuxCopyDepthToSwapchain(side, commandBuffer, image, srcWidth, srcHeight, frameIdx);
+         VulkanUtils::TransitionLayout(commandBuffer, image, VK_IMAGE_LAYOUT_GENERAL, imageLayout, VK_IMAGE_ASPECT_DEPTH_BIT);
+     }
++    static const int s_monoDepthClear = [] { const char* e = getenv("BETTERVR_LINUX_MONO_DEPTHCLEAR"); return e ? atoi(e) : 0; }();
++    if (LinuxMonoRender() && s_monoDepthClear == 1) return; // experiment: leave the game's depth untouched
++    if (LinuxMonoRender() && s_monoDepthClear == 2) {
++        VkClearDepthStencilValue far = *pDepthStencil;
++        far.depth = 1.0f;
++        pDispatch.CmdClearDepthStencilImage(commandBuffer, image, imageLayout, &far, rangeCount, pRanges);
++        return;
++    }
+     pDispatch.CmdClearDepthStencilImage(commandBuffer, image, imageLayout, pDepthStencil, rangeCount, pRanges);
+ }
+ 
++// See CemuHooks::hook_IsMonoRender: in mono frames only the left eye is rendered and its capture also fills
++// the right eye. The left eye capture happens before the patch moves on to the next frame (it waits for the
++// GPU after the left eye), so the current frame's flag applies.
++static bool LinuxMonoRender() {
++    return CemuHooks::IsMonoFrame();
++}
++
+ // Called from CmdClearColorImage on Cemu's rendering thread
+ // Blits game content to intermediate texture (NOT directly to swapchain)
+ void RND_Renderer::LinuxCopyColorToSwapchain(OpenXR::EyeSide side, VkCommandBuffer cmdBuffer, VkImage srcImage, uint32_t srcWidth, uint32_t srcHeight, long frameIdx) {
+@@ -1855,6 +2035,18 @@ void RND_Renderer::LinuxCopyColorToSwapchain(OpenXR::EyeSide side, VkCommandBuff
+     // Leave intermediate in TRANSFER_SRC for EndFrame to copy to swapchain
+     s_linux->intermediateColor[sideIdx][wIdx]->vkTransitionLayout(cmdBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+ 
++    const bool monoFill = LinuxMonoRender() && sideIdx == 0 && s_linux->intermediateColor[1][wIdx];
++    if (monoFill) {
++        VulkanTexture* right = s_linux->intermediateColor[1][wIdx];
++        right->vkTransitionLayout(cmdBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        blitRegion.dstOffsets[1] = { (int32_t)right->GetWidth(), (int32_t)right->GetHeight(), 1 };
++        dispatch->CmdBlitImage(cmdBuffer,
++            srcImage, VK_IMAGE_LAYOUT_GENERAL,
++            right->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            1, &blitRegion, VK_FILTER_LINEAR);
++        right->vkTransitionLayout(cmdBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    }
++
+     auto& captured = s_linux->captured3DFrames[wIdx];
+     std::array<XrView, 2> renderViewsSnapshot = { XrView{ XR_TYPE_VIEW }, XrView{ XR_TYPE_VIEW } };
+     XrTime renderDisplayTimeSnapshot = 0;
+@@ -1925,6 +2117,24 @@ void RND_Renderer::LinuxCopyColorToSwapchain(OpenXR::EyeSide side, VkCommandBuff
+         }
+     };
+ 
++    if (monoFill) {
++        captured.eyeCopied[1] = true;
++        captured.colorCopyAt[1] = captured.colorCopyAt[0];
++        captured.complete = true;
++        auto& pair = s_linux->pending3DPair;
++        pair.Reset();
++        pair.eyeCopied[0] = pair.eyeCopied[1] = true;
++        pair.bufferIdx[0] = pair.bufferIdx[1] = wIdx;
++        pair.colorCopyAt[0] = pair.colorCopyAt[1] = captured.colorCopyAt[0];
++        copyCurrentRenderSnapshotToPair(pair);
++        // the right eye shows the left eye's image, so it must be submitted with the left eye's pose and FOV
++        pair.renderViews[1] = pair.renderViews[0];
++        s_linux->completed3DPair = pair;
++        s_linux->frameHasContent = true;
++        pair.Reset();
++        return;
++    }
++
+     if (sideIdx == 0) {
+         auto& pair = s_linux->pending3DPair;
+         pair.Reset();
+@@ -2038,6 +2248,18 @@ void RND_Renderer::LinuxCopyDepthToSwapchain(OpenXR::EyeSide side, VkCommandBuff
+     s_linux->intermediateDepth[sideIdx][wIdx]->vkTransitionLayout(cmdBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+ 
+     s_linux->captured3DFrames[wIdx].depthCopied[sideIdx] = true;
++
++    if (LinuxMonoRender() && sideIdx == 0 && s_linux->intermediateDepth[1][wIdx]) {
++        VulkanTexture* right = s_linux->intermediateDepth[1][wIdx];
++        right->vkTransitionLayout(cmdBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        blitRegion.dstOffsets[1] = { (int32_t)right->GetWidth(), (int32_t)right->GetHeight(), 1 };
++        dispatch->CmdBlitImage(cmdBuffer,
++            srcImage, VK_IMAGE_LAYOUT_GENERAL,
++            right->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            1, &blitRegion, VK_FILTER_NEAREST);
++        right->vkTransitionLayout(cmdBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++        s_linux->captured3DFrames[wIdx].depthCopied[1] = true;
++    }
+ }
+ 
+ void RND_Renderer::LinuxCopyHudToSwapchain(VkCommandBuffer cmdBuffer, VkImage srcImage, uint32_t srcWidth, uint32_t srcHeight) {
+@@ -2142,10 +2364,15 @@ void RND_Renderer::LatchPendingIfNeeded() const {
+     // content for projection-layer reprojection.
+     {
+         std::unique_lock viewsLock(m_viewsMutex);
+-        constexpr float kTargetHeadHeight = 1.65f;
+-        float currentHeight = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+-        float heightOffset = kTargetHeadHeight - currentHeight;
+-        for (auto& v : views) v.pose.position.y += heightOffset;
++        // Opt-in: BETTERVR_LINUX_HEAD_PIN=1. Pinning the head to a fixed height every frame
++        // left the controllers unadjusted (hands sat too low); upstream Windows doesn't do it.
++        static const bool s_pinHead = [] { const char* e = getenv("BETTERVR_LINUX_HEAD_PIN"); return e && e[0] == '1'; }();
++        if (s_pinHead) {
++            constexpr float kTargetHeadHeight = 1.65f;
++            float currentHeight = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
++            float heightOffset = kTargetHeadHeight - currentHeight;
++            for (auto& v : views) v.pose.position.y += heightOffset;
++        }
+         m_currViews = views;
+         m_linuxCurrViewsDisplayTime = viewsDisplayTime;
+     }
+@@ -2181,6 +2408,7 @@ std::optional<std::array<XrView, 2>> RND_Renderer::UpdateViews(XrTime predictedD
+         return std::nullopt;
+     }
+ 
++    LinuxStabilizeViewFovs(views);
+     {
+         std::unique_lock viewsLock(m_viewsMutex);
+         m_currViews = views;
+diff --git a/src/utils/logger.cpp b/src/utils/logger.cpp
+index a74fcf4..f4bb574 100644
+--- a/src/utils/logger.cpp
++++ b/src/utils/logger.cpp
+@@ -36,6 +36,7 @@ static void LogSystemHardwareInfo() {
+         Log::print<INFO>("RAM: {:.2f} GiB", totalGiB);
+     }
+ #else
++#if defined(__x86_64__) || defined(__i386__)
+     // CPU brand via cpuid.h
+     unsigned int eax, ebx, ecx, edx;
+     if (__get_cpuid(0x80000000, &eax, &ebx, &ecx, &edx) && eax >= 0x80000004) {
+@@ -50,6 +51,7 @@ static void LogSystemHardwareInfo() {
+             Log::print<INFO>("CPU: {}", cpuBrand.c_str());
+         }
+     }
++#endif
+ 
+     struct sysinfo si{};
+     if (sysinfo(&si) == 0) {

@@ -1,0 +1,1109 @@
+diff --git a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
+index aba6f36..1936e37 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/BackendAArch64/BackendAArch64.cpp
+@@ -7,6 +7,8 @@
+ #include <xbyak_aarch64_util.h>
+ 
+ #include <cstddef>
++#include <unistd.h>
++#include <mutex>
+ 
+ #include "../PPCRecompiler.h"
+ #include "Common/precompiled.h"
+@@ -1616,6 +1618,24 @@ bool PPCRecompiler_generateAArch64Code(struct PPCRecFunction_t* PPCRecFunction,
+ 	// set code
+ 	PPCRecFunction->x86Code = aarch64GenContext.getCode<void*>();
+ 	PPCRecFunction->x86Size = aarch64GenContext.getMaxSize();
++	// CEMU_PERF_MAP=1: let perf attribute JIT samples to guest functions (/tmp/perf-<pid>.map)
++	{
++		static FILE* s_perfMap = []() -> FILE* {
++			const char* e = getenv("CEMU_PERF_MAP");
++			if (!e || e[0] != '1')
++				return nullptr;
++			FILE* f = fopen(fmt::format("/tmp/perf-{}.map", getpid()).c_str(), "w");
++			if (f)
++				setvbuf(f, nullptr, _IOLBF, 0);
++			return f;
++		}();
++		if (s_perfMap)
++		{
++			static std::mutex s_perfMapMtx;
++			std::lock_guard _l(s_perfMapMtx);
++			fprintf(s_perfMap, "%lx %lx ppc_0x%08x\n", (unsigned long)(uintptr_t)PPCRecFunction->x86Code, (unsigned long)codeSize, (unsigned)PPCRecFunction->ppcAddress);
++		}
++	}
+ 	// set free disabled to skip freeing the code from the CodeGenerator destructor
+ 	allocator.setFreeDisabled(true);
+ 	return true;
+diff --git a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
+index fae5127..b6ba40d 100644
+--- a/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
++++ b/src/Cafe/HW/Espresso/Recompiler/PPCRecompiler.cpp
+@@ -210,6 +210,8 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+ 	bool compiledSuccessfully = PPCRecompiler_generateIntermediateCode(ppcImlGenContext, ppcRecFunc, entryAddresses, boundaryTracker);
+ 	if (compiledSuccessfully == false)
+ 	{
++		if (getenv("CEMU_CORE_STATS"))
++			cemuLog_log(LogType::Force, "[jitfail] {} codegen failed for 0x{:08x} len 0x{:x} -> interpreter", "iml", range.startAddress, range.length);
+ 		delete ppcRecFunc;
+ 		return nullptr;
+ 	}
+@@ -244,6 +246,8 @@ PPCRecFunction_t* PPCRecompiler_recompileFunction(PPCFunctionBoundaryTracker::PP
+ 	bool aarch64GenerationSuccess = PPCRecompiler_generateAArch64Code(ppcRecFunc, &ppcImlGenContext);
+ 	if (aarch64GenerationSuccess == false)
+ 	{
++		if (getenv("CEMU_CORE_STATS"))
++			cemuLog_log(LogType::Force, "[jitfail] {} codegen failed for 0x{:08x} len 0x{:x} -> interpreter", "aarch64", range.startAddress, range.length);
+ 		return nullptr;
+ 	}
+ #endif
+diff --git a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
+index 5a4f1ce..b75d4f2 100644
+--- a/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
+@@ -1,4 +1,5 @@
+ #include "Cafe/HW/Latte/ISA/RegDefines.h"
++#include "Common/CemuProf.h"
+ #include "Cafe/OS/libs/gx2/GX2.h" // for write gatherer and special state. Get rid of dependency
+ #include "Cafe/OS/libs/gx2/GX2_Event.h" // for notification callbacks
+ #include "Cafe/HW/Latte/Renderer/Renderer.h"
+@@ -153,6 +154,22 @@ private:
+ 
+ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx);
+ 
++// GX2DrawDone on Vulkan: finish texture readbacks and occlusion queries.
++// CEMU_ASYNC_DRAWDONE=1: only collect what already finished instead of blocking on the host GPU (cpu agent experiment);
++// guest buffers are already safe to reuse once Latte has translated the commands, so only readback/query latency changes.
++void LatteCP_syncAsyncOperations()
++{
++	static const bool s_async = [] { const char* e = getenv("CEMU_ASYNC_DRAWDONE"); return e && e[0] == '1'; }();
++	if (s_async)
++	{
++		LatteTextureReadback_UpdateFinishedTransfers(false);
++		LatteQuery_UpdateFinishedQueries();
++		return;
++	}
++	LatteTextureReadback_UpdateFinishedTransfers(true);
++	LatteQuery_UpdateFinishedQueriesForceFinishAll();
++}
++
+ // called whenever the GPU runs out of commands or hits a wait condition (semaphores, HLE waits)
+ void LatteCP_signalEnterWait()
+ {
+@@ -175,6 +192,7 @@ uint32 LatteCP_readU32Deprc()
+ 			return cmdWord;
+ 
+ 		g_renderer->NotifyLatteCommandProcessorIdle(); // let the renderer know in case it wants to flush any commands
++		cprof::LatteScope _cprofIdle(cprof::L_RING_IDLE);
+ 		performanceMonitor.gpuTime_idleTime.beginMeasuring();
+ 		// no command data available, spin in a busy loop for a bit then check again
+ 		for (sint32 busy = 0; busy < 80; busy++)
+@@ -479,6 +497,7 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
+ 	if ((word0 & 0x10) != 0)
+ 	{
+ 		// wait for memory address
++		cprof::LatteScope _cprofFence(cprof::L_FENCE);
+ 		performanceMonitor.gpuTime_fenceTime.beginMeasuring();
+ 		while (true)
+ 		{
+@@ -962,6 +981,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
+ 	cemu_assert_debug(nWords == 1);
+ 	MPTR reserved1 = LatteReadCMD(); // reserved
+ 	// wait for flip
++	cprof::LatteScope _cprofFlip(cprof::L_FLIP);
+ 	uint32 currentFlipCount = LatteGPUState.flipCounter;
+ 	while (true)
+ 	{
+@@ -1411,8 +1431,7 @@ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx)
+ 				}
+ 				case IT_HLE_SYNC_ASYNC_OPERATIONS:
+ 				{
+-					LatteTextureReadback_UpdateFinishedTransfers(true);
+-					LatteQuery_UpdateFinishedQueriesForceFinishAll();
++					LatteCP_syncAsyncOperations();
+ 					break;
+ 				}
+ 				default:
+@@ -1719,8 +1738,7 @@ void LatteCP_ProcessRingbuffer()
+ 			case IT_HLE_SYNC_ASYNC_OPERATIONS:
+ 			{
+ 				//LatteCP_skipWords<LatteCP_readU32Deprc>(nWords);
+-				LatteTextureReadback_UpdateFinishedTransfers(true);
+-				LatteQuery_UpdateFinishedQueriesForceFinishAll();
++				LatteCP_syncAsyncOperations();
+ 				break;
+ 			}
+ 			default:
+diff --git a/src/Cafe/HW/Latte/Core/LatteQuery.cpp b/src/Cafe/HW/Latte/Core/LatteQuery.cpp
+index a8329e6..643572a 100644
+--- a/src/Cafe/HW/Latte/Core/LatteQuery.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteQuery.cpp
+@@ -56,7 +56,9 @@ void LatteQuery_finishGX2Query(LatteGX2QueryInformation* gx2Query)
+ {
+ 	uint32* queryObjectData = (uint32*)memory_getPointerFromVirtualOffset(gx2Query->queryMPTR);
+ 	*(uint64*)(queryObjectData + 0) = 0;
+-	*(uint64*)(queryObjectData + 2) = gx2Query->sampleSum;
++	// CEMU_OCCLUSION_FORCE_VISIBLE=1: report every occlusion query as visible (diagnostic for culling issues)
++	static const bool s_forceVisible = [] { const char* e = getenv("CEMU_OCCLUSION_FORCE_VISIBLE"); return e && e[0] == '1'; }();
++	*(uint64*)(queryObjectData + 2) = s_forceVisible ? std::max<uint64>(gx2Query->sampleSum, 0x100000) : gx2Query->sampleSum;
+ 	*(uint64*)(queryObjectData + 4) = 0;
+ 	*(uint64*)(queryObjectData + 6) = 0;
+ 
+diff --git a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
+index 79b2d69..bc2bc49 100644
+--- a/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
++++ b/src/Cafe/HW/Latte/Core/LatteRenderTarget.cpp
+@@ -1,4 +1,5 @@
+ #include "Cafe/HW/Latte/ISA/RegDefines.h"
++#include "Common/CemuProf.h"
+ 
+ #include "Cafe/HW/Latte/Core/Latte.h"
+ #include "Cafe/HW/Latte/Core/LatteDraw.h"
+@@ -683,7 +684,11 @@ void LatteRenderTarget_itHLESwapScanBuffer()
+ 		performanceMonitor.gpuTime_frameTime.endMeasuring();
+ 	LattePerformanceMonitor_frameEnd();
+ 	LatteGPUState.frameCounter++;
+-	g_renderer->SwapBuffers(true, true);
++	cprof::latteFrameTick();
++	{
++		cprof::LatteScope _cprofSwap(cprof::L_SWAP);
++		g_renderer->SwapBuffers(true, true);
++	}
+ 
+ 	catchOpenGLError();
+ 	performanceMonitor.gpuTime_frameTime.beginMeasuring();
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/CachedFBOVk.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/CachedFBOVk.cpp
+index 20c88b2..6dcc6c3 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/CachedFBOVk.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/CachedFBOVk.cpp
+@@ -36,7 +36,12 @@ void CachedFBOVk::CreateRenderPass()
+ 		attachmentInfo.depthAttachment.viewObj = nullptr;
+ 	}
+ 
+-	m_vkrObjRenderPass = new VKRObjectRenderPass(attachmentInfo);
++	bool hasColorAttachment = false;
++	for (int i = 0; i < 8; ++i)
++		hasColorAttachment |= attachmentInfo.colorAttachment[i].viewObj != nullptr;
++	const bool useFragmentDensityMap = VulkanRenderer::GetInstance()->FDM_UseForFramebuffer(m_size, hasColorAttachment);
++	const bool isFoveationTarget = VulkanRenderer::GetInstance()->FOV_IsTargetFramebuffer(m_size, hasColorAttachment);
++	m_vkrObjRenderPass = new VKRObjectRenderPass(attachmentInfo, Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS, useFragmentDensityMap, isFoveationTarget);
+ }
+ 
+ CachedFBOVk::~CachedFBOVk()
+@@ -93,7 +98,10 @@ void CachedFBOVk::CreateFramebuffer()
+ 
+ 	cemu_assert_debug(imageViewIndex < 9);
+ 
+-	m_vkrObjFramebuffer = new VKRObjectFramebuffer(m_vkrObjRenderPass, std::span<VKRObjectTextureView*>(imageViews.data(), imageViewIndex), m_size);
++	VkImageView fragmentDensityMapView = VK_NULL_HANDLE;
++	if (m_vkrObjRenderPass->m_hasFragmentDensityMap)
++		fragmentDensityMapView = VulkanRenderer::GetInstance()->FDM_GetMapView(m_size);
++	m_vkrObjFramebuffer = new VKRObjectFramebuffer(m_vkrObjRenderPass, std::span<VKRObjectTextureView*>(imageViews.data(), imageViewIndex), m_size, fragmentDensityMapView);
+ 
+ 	m_extend = { (uint32)m_size.x, (uint32)m_size.y };
+ }
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h
+index 7d2cb65..72e2330 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VKRBase.h
+@@ -190,18 +190,20 @@ public:
+ 	}
+ 
+ public:
+-	VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint32 colorAttachmentCount = Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS);
++	VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint32 colorAttachmentCount = Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS, bool useFragmentDensityMap = false, bool isFoveationTarget = false);
+ 	~VKRObjectRenderPass() override;
+ 	VkRenderPass m_renderPass{ VK_NULL_HANDLE };
+ 	VkFormat m_colorAttachmentFormat[Latte::GPU_LIMITS::NUM_COLOR_ATTACHMENTS];
+ 	VkFormat m_depthAttachmentFormat;
+ 	uint64 m_hashForPipeline; // helper var. Holds hash of all the renderpass creation parameters (mainly the formats) that affect the pipeline state
++	bool m_hasFragmentDensityMap{ false }; // the fragment density map is the last attachment
++	bool m_isFoveationTarget{ false }; // eye-sized colour target, pipelines get the BetterVR shading rate state
+ };
+ 
+ class VKRObjectFramebuffer : public VKRDestructibleObject
+ {
+ public:
+-	VKRObjectFramebuffer(VKRObjectRenderPass* renderPass, std::span<VKRObjectTextureView*> attachments, Vector2i size);
++	VKRObjectFramebuffer(VKRObjectRenderPass* renderPass, std::span<VKRObjectTextureView*> attachments, Vector2i size, VkImageView fragmentDensityMapView = VK_NULL_HANDLE);
+ 	~VKRObjectFramebuffer() override;
+ 
+ 	VkFramebuffer m_frameBuffer{ VK_NULL_HANDLE };
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
+index 2800b81..56aaf67 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp
+@@ -985,6 +985,17 @@ bool PipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool show
+ 		pipelineRobustnessCreateInfo.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DEVICE_DEFAULT_EXT;
+ 	}
+ 
++	VkPipelineFragmentShadingRateStateCreateInfoKHR shadingRateState{};
++	if (m_renderPassObj->m_isFoveationTarget && vkRenderer->m_fdm.vrsCeilingRate > 1)
++	{
++		shadingRateState.sType = VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR;
++		shadingRateState.fragmentSize = { vkRenderer->m_fdm.vrsCeilingRate, vkRenderer->m_fdm.vrsCeilingRate };
++		shadingRateState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
++		shadingRateState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
++		shadingRateState.pNext = prevStruct;
++		prevStruct = &shadingRateState;
++	}
++
+ 	pipelineInfo.pNext = prevStruct;
+ 
+ 	VkPipeline pipeline = VK_NULL_HANDLE;
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
+index d0e391e..9c3dc4e 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
+@@ -1,4 +1,5 @@
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
++#include "Common/CemuProf.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.h"
+ #include "Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.h"
+@@ -746,6 +747,65 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+ 		attachmentFeedbackLoopDynamicStateFeature.attachmentFeedbackLoopDynamicState = VK_TRUE;
+ 	}
+ 
++	// enable VK_EXT_fragment_density_map (BetterVR foveated rendering)
++	VkPhysicalDeviceFragmentDensityMapFeaturesEXT fragmentDensityMapFeature{};
++	if (m_featureControl.deviceExtensions.fragment_density_map)
++	{
++		VkPhysicalDeviceFragmentDensityMapFeaturesEXT supported{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT };
++		VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
++		features2.pNext = &supported;
++		vkGetPhysicalDeviceFeatures2(m_physicalDevice, &features2);
++		VkPhysicalDeviceFragmentDensityMapPropertiesEXT fdmProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT };
++		VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
++		props2.pNext = &fdmProps;
++		vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
++
++		int fdmWidth = 0, fdmHeight = 0;
++		const char* sizeEnv = std::getenv("CEMU_FDM_SIZE");
++		if (supported.fragmentDensityMap && supported.fragmentDensityMapNonSubsampledImages && sizeEnv && sscanf(sizeEnv, "%dx%d", &fdmWidth, &fdmHeight) == 2 && fdmWidth > 0 && fdmHeight > 0)
++		{
++			fragmentDensityMapFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT;
++			fragmentDensityMapFeature.pNext = deviceExtensionFeatures;
++			deviceExtensionFeatures = &fragmentDensityMapFeature;
++			fragmentDensityMapFeature.fragmentDensityMap = VK_TRUE;
++			fragmentDensityMapFeature.fragmentDensityMapNonSubsampledImages = VK_TRUE;
++			m_fdm.enabled = true;
++			m_fdm.targetSize = Vector2i(fdmWidth, fdmHeight);
++			m_fdm.texelSize = fdmProps.minFragmentDensityTexelSize;
++			cemuLog_log(LogType::Force, "BetterVR FDM: foveated rendering enabled for {}x{} framebuffers (density texel size {}x{}..{}x{})", fdmWidth, fdmHeight,
++				fdmProps.minFragmentDensityTexelSize.width, fdmProps.minFragmentDensityTexelSize.height, fdmProps.maxFragmentDensityTexelSize.width, fdmProps.maxFragmentDensityTexelSize.height);
++		}
++		else
++		{
++			m_featureControl.deviceExtensions.fragment_density_map = false;
++			cemuLog_log(LogType::Force, "BetterVR FDM: not enabled (fragmentDensityMap={} nonSubsampled={} CEMU_FDM_SIZE={})", supported.fragmentDensityMap, supported.fragmentDensityMapNonSubsampledImages, sizeEnv ? sizeEnv : "unset");
++		}
++	}
++
++	// enable VK_KHR_fragment_shading_rate (BetterVR VRS experiments)
++	VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragmentShadingRateFeature{};
++	if (m_featureControl.deviceExtensions.fragment_shading_rate)
++	{
++		VkPhysicalDeviceFragmentShadingRateFeaturesKHR supported{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR };
++		VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
++		features2.pNext = &supported;
++		vkGetPhysicalDeviceFeatures2(m_physicalDevice, &features2);
++		int fovWidth = 0, fovHeight = 0;
++		const char* sizeEnv = std::getenv("CEMU_FDM_SIZE");
++		if (supported.pipelineFragmentShadingRate && sizeEnv && sscanf(sizeEnv, "%dx%d", &fovWidth, &fovHeight) == 2)
++		{
++			fragmentShadingRateFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
++			fragmentShadingRateFeature.pNext = deviceExtensionFeatures;
++			deviceExtensionFeatures = &fragmentShadingRateFeature;
++			fragmentShadingRateFeature.pipelineFragmentShadingRate = VK_TRUE;
++			m_fdm.vrsCeilingRate = (uint32)atoi(std::getenv("CEMU_VRS"));
++			m_fdm.targetSize = Vector2i(fovWidth, fovHeight);
++			cemuLog_log(LogType::Force, "BetterVR VRS: uniform {0}x{0} shading rate on {1}x{2} framebuffers", m_fdm.vrsCeilingRate, fovWidth, fovHeight);
++		}
++		else
++			m_featureControl.deviceExtensions.fragment_shading_rate = false;
++	}
++
+ 	std::vector<const char*> used_extensions;
+ 	VkDeviceCreateInfo createInfo = CreateDeviceCreateInfo(queueCreateInfos, deviceFeatures, deviceExtensionFeatures, used_extensions);
+ 
+@@ -1330,6 +1390,10 @@ VkDeviceCreateInfo VulkanRenderer::CreateDeviceCreateInfo(const std::vector<VkDe
+ 	}
+ 	if (m_featureControl.deviceExtensions.pipeline_robustness)
+ 		used_extensions.emplace_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
++	if (m_featureControl.deviceExtensions.fragment_density_map)
++		used_extensions.emplace_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
++	if (m_featureControl.deviceExtensions.fragment_shading_rate)
++		used_extensions.emplace_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+ 	if (UseAttachmentFeedbackLoop())
+ 	{
+ 		used_extensions.emplace_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+@@ -1434,6 +1498,12 @@ bool VulkanRenderer::CheckDeviceExtensionSupport(const VkPhysicalDevice device,
+ 	info.deviceExtensions.pipeline_robustness = isExtensionAvailable(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+ 	info.deviceExtensions.attachment_feedback_loop_layout = isExtensionAvailable(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+ 	info.deviceExtensions.attachment_feedback_loop_dynamic_state = isExtensionAvailable(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
++	{
++		const char* fdmEnv = std::getenv("CEMU_FDM");
++		info.deviceExtensions.fragment_density_map = fdmEnv && fdmEnv[0] == '1' && isExtensionAvailable(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
++		const char* vrsEnv = std::getenv("CEMU_VRS");
++		info.deviceExtensions.fragment_shading_rate = vrsEnv && atoi(vrsEnv) > 1 && isExtensionAvailable(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
++	}
+ 	// dynamic rendering doesn't provide any benefits for us right now. Driver implementations are very unoptimized as of Feb 2022
+ 	info.deviceExtensions.present_wait = isExtensionAvailable(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) && isExtensionAvailable(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+ 
+@@ -2181,6 +2251,7 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
+ {
+ 	cemu_assert_debug(m_commandBufferSyncIndex != m_commandBufferIndex);
+ 	// wait on least recently submitted command buffer
++	cprof::LatteScope _cprofVk(cprof::L_VKFENCE);
+ 	VkResult result = vkWaitForFences(m_logicalDevice, 1, &m_cmdBufferFences[m_commandBufferSyncIndex], true, UINT64_MAX);
+ 	if (result == VK_TIMEOUT)
+ 	{
+@@ -4146,8 +4217,9 @@ void VKRObjectSampler::DestroyCache()
+ 	s_samplerCache.clear();
+ }
+ 
+-VKRObjectRenderPass::VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint32 colorAttachmentCount)
++VKRObjectRenderPass::VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint32 colorAttachmentCount, bool useFragmentDensityMap, bool isFoveationTarget)
+ {
++	m_isFoveationTarget = isFoveationTarget;
+ 	VulkanRenderer* vkRenderer = VulkanRenderer::GetInstance();
+ 	bool useAttachmentFeedbackLoop = vkRenderer->UseAttachmentFeedbackLoop();
+ 	VkImageLayout attachmentLayout = useAttachmentFeedbackLoop ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL;
+@@ -4167,6 +4239,10 @@ VKRObjectRenderPass::VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint3
+ 		stateHash += attachmentInfo.depthAttachment.format;
+ 		stateHash = std::rotl<uint64>(stateHash, 7);
+ 	}
++	if (useFragmentDensityMap)
++		stateHash ^= 0xFD0FD0FD0FD0FD0Full; // pipelines must be compiled against a render pass with the density map
++	if (isFoveationTarget)
++		stateHash ^= 0x5EA5EA5EA5EA5EA5ull; // pipelines of eye-sized targets carry the shading rate state
+ 	m_hashForPipeline = stateHash;
+ 
+ 	// setup Vulkan renderpass
+@@ -4235,6 +4311,26 @@ VKRObjectRenderPass::VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint3
+ 		attachments_descriptions.emplace_back(entry);
+ 	}
+ 
++	VkRenderPassFragmentDensityMapCreateInfoEXT fragmentDensityMapInfo{};
++	if (useFragmentDensityMap)
++	{
++		m_hasFragmentDensityMap = true;
++		fragmentDensityMapInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT;
++		fragmentDensityMapInfo.fragmentDensityMapAttachment.attachment = (uint32)attachments_descriptions.size();
++		fragmentDensityMapInfo.fragmentDensityMapAttachment.layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
++
++		VkAttachmentDescription entry{};
++		entry.format = VK_FORMAT_R8G8_UNORM;
++		entry.samples = VK_SAMPLE_COUNT_1_BIT;
++		entry.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++		entry.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++		entry.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++		entry.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++		entry.initialLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
++		entry.finalLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
++		attachments_descriptions.emplace_back(entry);
++	}
++
+ 	// todo - use numColorAttachments instead of .size() or colorAttachmentCount (needs adjusting in many places)
+ 
+ 	VkSubpassDescription subpass{};
+@@ -4274,6 +4370,9 @@ VKRObjectRenderPass::VKRObjectRenderPass(AttachmentInfo_t& attachmentInfo, sint3
+ 	// Reverted this again to zero for Cemu 1.25.5b as the performance cost is just too high. Manual synchronization is preferred
+ 	// as of Cemu 2.7 we are now using VK_EXT_attachment_feedback_loop_layout with a matching renderpass dependency if supported. Otherwise we are falling back to the above
+ 
++	if (useFragmentDensityMap)
++		renderPassInfo.pNext = &fragmentDensityMapInfo;
++
+ 	if (vkCreateRenderPass(vkRenderer->GetLogicalDevice(), &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS)
+ 	{
+ 		cemuLog_log(LogType::Force, "Vulkan-Error: Failed to create render pass");
+@@ -4298,18 +4397,24 @@ VKRObjectRenderPass::~VKRObjectRenderPass()
+ 	performanceMonitor.vk.numRenderPass.decrement();
+ }
+ 
+-VKRObjectFramebuffer::VKRObjectFramebuffer(VKRObjectRenderPass* renderPass, std::span<VKRObjectTextureView*> attachments, Vector2i size)
++VKRObjectFramebuffer::VKRObjectFramebuffer(VKRObjectRenderPass* renderPass, std::span<VKRObjectTextureView*> attachments, Vector2i size, VkImageView fragmentDensityMapView)
+ {
+ 	// convert VKRObjectTextureView* array to vkImageView array
+ 	std::array<VkImageView, 16> attachmentViews;
+-	cemu_assert(attachments.size() < attachmentViews.size());
++	cemu_assert(attachments.size() + 1 < attachmentViews.size());
++	size_t attachmentCount = attachments.size();
+ 	for (size_t i = 0; i < attachments.size(); i++)
+ 		attachmentViews[i] = attachments[i]->m_textureImageView;
++	if (renderPass->m_hasFragmentDensityMap)
++	{
++		cemu_assert(fragmentDensityMapView != VK_NULL_HANDLE);
++		attachmentViews[attachmentCount++] = fragmentDensityMapView;
++	}
+ 
+ 	VkFramebufferCreateInfo createInfo{};
+ 	createInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+ 	createInfo.pAttachments = attachmentViews.data();
+-	createInfo.attachmentCount = attachments.size();
++	createInfo.attachmentCount = (uint32)attachmentCount;
+ 	createInfo.renderPass = renderPass->m_renderPass;
+ 	createInfo.layers = 1;
+ 	createInfo.width = size.x;
+@@ -4377,3 +4482,125 @@ VKRObjectDescriptorSet::~VKRObjectDescriptorSet()
+ 	vkFreeDescriptorSets(vkr->GetLogicalDevice(), vkr->GetDescriptorPool(), 1, &descriptorSet);
+ 	performanceMonitor.vk.numDescriptorSets.decrement();
+ }
++
++// BetterVR fixed foveated rendering (VK_EXT_fragment_density_map)
++// The density map is sampled by the driver per tile. Full density in an ellipse around the optical
++// centre (both eyes render into the same targets, so it has to cover both centres), half density
++// in a ring around it and quarter density at the edges. Tunable via CEMU_FDM_INNER / CEMU_FDM_OUTER
++// (ellipse radii as a fraction of the framebuffer) and CEMU_FDM_CENTER_Y.
++
++bool VulkanRenderer::FOV_IsTargetFramebuffer(Vector2i size, bool hasColorAttachment) const
++{
++	return (m_fdm.enabled || m_fdm.vrsCeilingRate > 1) && hasColorAttachment && size.x == m_fdm.targetSize.x && size.y == m_fdm.targetSize.y;
++}
++
++bool VulkanRenderer::FDM_UseForFramebuffer(Vector2i size, bool hasColorAttachment) const
++{
++	return m_fdm.enabled && hasColorAttachment && size.x == m_fdm.targetSize.x && size.y == m_fdm.targetSize.y;
++}
++
++static float FDM_GetEnvFloat(const char* name, float defaultValue)
++{
++	const char* value = std::getenv(name);
++	return value ? (float)atof(value) : defaultValue;
++}
++
++VkImageView VulkanRenderer::FDM_GetMapView(Vector2i size)
++{
++	for (auto& map : m_fdm.maps)
++	{
++		if (map.size.x == size.x && map.size.y == size.y)
++			return map.view;
++	}
++
++	FDMMap map{};
++	map.size = size;
++	const uint32 mapWidth = (size.x + m_fdm.texelSize.width - 1) / m_fdm.texelSize.width;
++	const uint32 mapHeight = (size.y + m_fdm.texelSize.height - 1) / m_fdm.texelSize.height;
++
++	VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++	imageInfo.imageType = VK_IMAGE_TYPE_2D;
++	imageInfo.format = VK_FORMAT_R8G8_UNORM;
++	imageInfo.extent = { mapWidth, mapHeight, 1 };
++	imageInfo.mipLevels = 1;
++	imageInfo.arrayLayers = 1;
++	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
++	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++	imageInfo.usage = VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	if (vkCreateImage(m_logicalDevice, &imageInfo, nullptr, &map.image) != VK_SUCCESS)
++		throw std::runtime_error("BetterVR FDM: failed to create density map image");
++
++	VkMemoryRequirements memReq;
++	vkGetImageMemoryRequirements(m_logicalDevice, map.image, &memReq);
++	uint32 memoryIndex = 0;
++	if (!memoryManager->FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memoryIndex))
++		throw std::runtime_error("BetterVR FDM: no device local memory for density map");
++	VkMemoryAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++	allocInfo.allocationSize = memReq.size;
++	allocInfo.memoryTypeIndex = memoryIndex;
++	if (vkAllocateMemory(m_logicalDevice, &allocInfo, nullptr, &map.memory) != VK_SUCCESS)
++		throw std::runtime_error("BetterVR FDM: failed to allocate density map memory");
++	vkBindImageMemory(m_logicalDevice, map.image, map.memory, 0);
++
++	VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++	viewInfo.image = map.image;
++	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++	viewInfo.format = VK_FORMAT_R8G8_UNORM;
++	viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++	if (vkCreateImageView(m_logicalDevice, &viewInfo, nullptr, &map.view) != VK_SUCCESS)
++		throw std::runtime_error("BetterVR FDM: failed to create density map view");
++
++	// fill the density pattern via a staging buffer (kept alive since the copy is recorded into the current command buffer)
++	const VkDeviceSize dataSize = (VkDeviceSize)mapWidth * mapHeight * 2;
++	memoryManager->CreateBuffer(dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, map.stagingBuffer, map.stagingMemory);
++	uint8* data = nullptr;
++	vkMapMemory(m_logicalDevice, map.stagingMemory, 0, dataSize, 0, (void**)&data);
++	const float inner = FDM_GetEnvFloat("CEMU_FDM_INNER", 0.33f);
++	const float outer = FDM_GetEnvFloat("CEMU_FDM_OUTER", 0.55f);
++	const float centerY = FDM_GetEnvFloat("CEMU_FDM_CENTER_Y", 0.45f);
++	uint32 counts[3]{};
++	for (uint32 y = 0; y < mapHeight; y++)
++	{
++		for (uint32 x = 0; x < mapWidth; x++)
++		{
++			const float u = ((float)x + 0.5f) / (float)mapWidth - 0.5f;
++			const float v = ((float)y + 0.5f) / (float)mapHeight - centerY;
++			const float r = std::sqrt(u * u + v * v);
++			uint8 density = 255; // 1.0 = full resolution
++			if (r > outer) { density = 64; counts[2]++; } // 0.25 = 4x4 pixels per fragment
++			else if (r > inner) { density = 128; counts[1]++; } // 0.5 = 2x2 pixels per fragment
++			else counts[0]++;
++			data[(y * mapWidth + x) * 2 + 0] = density;
++			data[(y * mapWidth + x) * 2 + 1] = density;
++		}
++	}
++	vkUnmapMemory(m_logicalDevice, map.stagingMemory);
++
++	draw_endRenderPass();
++	VkCommandBuffer cmd = m_state.currentCommandBuffer;
++	VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.image = map.image;
++	barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++	barrier.srcAccessMask = 0;
++	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	VkBufferImageCopy region{};
++	region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	region.imageExtent = { mapWidth, mapHeight, 1 };
++	vkCmdCopyBufferToImage(cmd, map.stagingBuffer, map.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++	barrier.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
++	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++	barrier.dstAccessMask = VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
++	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++
++	cemuLog_log(LogType::Force, "BetterVR FDM: created {}x{} density map for {}x{} framebuffers (full={} half={} quarter={} texels)", mapWidth, mapHeight, size.x, size.y, counts[0], counts[1], counts[2]);
++	m_fdm.maps.emplace_back(map);
++	return map.view;
++}
+diff --git a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
+index 3b78d3c..f2b39e0 100644
+--- a/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
++++ b/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h
+@@ -470,6 +470,8 @@ private:
+ 			bool pipeline_robustness = false; // VK_EXT_pipeline_robustness
+ 			bool attachment_feedback_loop_layout = false; // VK_EXT_attachment_feedback_loop_layout
+ 			bool attachment_feedback_loop_dynamic_state = false; // VK_EXT_attachment_feedback_loop_dynamic_state (this is forced to false if VK_EXT_attachment_feedback_loop_layout is not supported)
++			bool fragment_density_map = false; // VK_EXT_fragment_density_map (BetterVR foveated rendering, opt-in via CEMU_FDM=1)
++			bool fragment_shading_rate = false; // VK_KHR_fragment_shading_rate (BetterVR VRS experiments, opt-in via CEMU_VRS=2|4)
+ 		}deviceExtensions;
+ 
+ 		struct
+@@ -959,6 +961,28 @@ public:
+ 	bool IsTracingToolEnabled() const { return m_featureControl.usingTracingTool; }
+ 	bool UseAttachmentFeedbackLoop() const { return m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state; }
+ 
++	// BetterVR fixed foveated rendering: render passes whose framebuffer matches CEMU_FDM_SIZE get a fragment density map
++	bool FDM_UseForFramebuffer(Vector2i size, bool hasColorAttachment) const;
++	bool FOV_IsTargetFramebuffer(Vector2i size, bool hasColorAttachment) const; // eye-sized colour target (FDM or VRS)
++	VkImageView FDM_GetMapView(Vector2i size);
++	struct FDMMap
++	{
++		Vector2i size;
++		VkImage image{ VK_NULL_HANDLE };
++		VkDeviceMemory memory{ VK_NULL_HANDLE };
++		VkImageView view{ VK_NULL_HANDLE };
++		VkBuffer stagingBuffer{ VK_NULL_HANDLE };
++		VkDeviceMemory stagingMemory{ VK_NULL_HANDLE };
++	};
++	struct
++	{
++		bool enabled = false;
++		uint32 vrsCeilingRate = 0; // CEMU_VRS: uniform NxN shading rate on every eye-sized pass (measures the best case VRS gain)
++		Vector2i targetSize{ 0, 0 };
++		VkExtent2D texelSize{ 32, 32 }; // minFragmentDensityTexelSize: finest map the driver can use
++		std::vector<FDMMap> maps;
++	}m_fdm;
++
+ private:
+ 
+ 	// debug
+diff --git a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
+index 52dc031..2457706 100644
+--- a/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
++++ b/src/Cafe/OS/libs/coreinit/coreinit_Thread.cpp
+@@ -50,6 +50,252 @@ sint32 activeThreadCount = 0;
+ 
+ void nnNfp_update();
+ 
++#include "Common/CemuProf.h"
++#include "Cafe/OS/RPL/rpl_symbol_storage.h"
++#include <pthread.h>
++#include <map>
++#include <tuple>
++
++// ---- CEMU_CORE_STATS=1: per emulated core idle/blocker attribution (cpu agent) ----
++// Everything here is only touched while the scheduler lock is held.
++namespace cstat
++{
++	struct Agg { uint64 ticks = 0; uint32 count = 0; };
++	struct CoreState
++	{
++		uint64 idleStart = 0;
++		uint64 runStart = 0;
++		MPTR runThread = 0;
++		// what the thread that last left this core was doing
++		MPTR blkThread = 0; uint32 blkPC = 0; uint32 blkLR = 0; bool blkWaiting = false;
++		std::string waker;
++		bool idling = false;
++		std::map<std::tuple<uint32, uint32, uint32, std::string>, Agg> idleBy; // (thread, pc, lr, waker)
++		std::map<MPTR, Agg> runBy;
++		uint64 idleTotal = 0;
++	};
++	CoreState s_core[3];
++	uint64 s_lastDump = 0;
++	struct ThrState { uint32 pc = 0, lr = 0; bool waiting = false; std::string waker; };
++	std::map<MPTR, ThrState> s_thr;
++	MPTR s_primary[3]{}; // busiest guest thread per core in the previous window; idle time is attributed to its wait
++
++	static const char* hostName()
++	{
++		thread_local char name[20] = {};
++		if (!name[0])
++			pthread_getname_np(pthread_self(), name, sizeof(name));
++		return name;
++	}
++
++	static std::string guestThreadName(MPTR t)
++	{
++		if (!t)
++			return "-";
++		OSThread_t* th = (OSThread_t*)memory_getPointerFromVirtualOffset(t);
++		const char* n = th->threadName.GetPtr();
++		return n ? std::string(n) : fmt::format("thr_{:08x}", t);
++	}
++
++	static std::string symAt(uint32 pc)
++	{
++		if (!pc)
++			return "-";
++		RPLStoredSymbol* s = rplSymbolStorage_getByAddress(pc);
++		if (s)
++			return fmt::format("{}.{}", (const char*)s->libName, (const char*)s->symbolName);
++		return fmt::format("{:08x}", pc);
++	}
++
++	void runEnd(uint32 core, MPTR thread)
++	{
++		CoreState& c = s_core[core];
++		if (c.runStart && c.runThread == thread)
++		{
++			Agg& a = c.runBy[thread];
++			a.ticks += cprof::ticks() - c.runStart;
++			a.count++;
++		}
++		c.runStart = 0;
++	}
++
++	void runBegin(uint32 core, MPTR thread)
++	{
++		CoreState& c = s_core[core];
++		c.runStart = cprof::ticks();
++		c.runThread = thread;
++	}
++
++	// current thread leaves the core (blocked or time slice over)
++	void switchOut(uint32 core, OSThread_t* thread, PPCInterpreter_t* hCPU)
++	{
++		MPTR t = memory_getVirtualOffsetFromPointer(thread);
++		runEnd(core, t);
++		CoreState& c = s_core[core];
++		c.blkThread = t;
++		c.blkWaiting = thread->state != OSThread_t::THREAD_STATE::STATE_RUNNING;
++		c.blkPC = c.blkWaiting ? hCPU->instructionPointer : 0;
++		c.blkLR = c.blkWaiting ? hCPU->spr.LR : 0;
++		ThrState& ts = s_thr[t];
++		ts.waiting = c.blkWaiting; ts.pc = c.blkPC; ts.lr = c.blkLR; ts.waker.clear();
++	}
++
++	void idleBegin(uint32 core)
++	{
++		CoreState& c = s_core[core];
++		c.idleStart = cprof::ticks();
++		c.idling = true;
++		c.waker.clear();
++	}
++
++	void dump();
++
++	void idleEnd(uint32 core, OSThread_t* next)
++	{
++		CoreState& c = s_core[core];
++		uint64 now = cprof::ticks();
++		if (c.idling && c.idleStart)
++		{
++			uint64 d = now - c.idleStart;
++			MPTR nextT = memory_getVirtualOffsetFromPointer(next);
++			MPTR prim = s_primary[core];
++			std::tuple<uint32, uint32, uint32, std::string> key;
++			auto pit = prim ? s_thr.find(prim) : s_thr.end();
++			if (pit != s_thr.end() && (pit->second.waiting || nextT == prim))
++			{
++				// attribute to what the core's main thread was waiting for
++				if (nextT == prim)
++					key = std::make_tuple(prim, pit->second.pc, pit->second.lr, pit->second.waiting ? pit->second.waker : std::string("timeslice"));
++				else
++					key = std::make_tuple(prim, pit->second.pc, pit->second.lr, std::string("(still waiting; ran ") + guestThreadName(nextT) + ")");
++			}
++			else
++			{
++				MPTR bt = c.blkWaiting ? c.blkThread : 0;
++				key = std::make_tuple(bt, c.blkPC, c.blkLR, c.blkWaiting ? c.waker : std::string("timeslice"));
++			}
++			// short idles (thread still runnable, normal main-core time slice switch) collapse into one key
++			Agg& a = c.idleBy[key];
++			a.ticks += d;
++			a.count++;
++			c.idleTotal += d;
++		}
++		c.idling = false;
++		runBegin(core, memory_getVirtualOffsetFromPointer(next));
++		if (core == 1)
++		{
++			if (!s_lastDump)
++				s_lastDump = now;
++			else if (now - s_lastDump > cprof::freq() * 5)
++				dump();
++		}
++	}
++
++	// thread becomes runnable: remember who woke an idle core
++	void onReady(OSThread_t* thread, uint32 core)
++	{
++		CoreState& c = s_core[core];
++		MPTR t = memory_getVirtualOffsetFromPointer(thread);
++		bool isPrim = t == s_primary[core];
++		if ((!c.idling || !c.waker.empty()) && !isPrim)
++			return;
++		std::string w = hostName();
++		PPCInterpreter_t* cur = PPCInterpreter_getCurrentInstance();
++		if (cur)
++		{
++			OSThread_t* wt = coreinit::OSGetCurrentThread();
++			if (wt)
++				w += fmt::format(":{}@{:08x}", guestThreadName(memory_getVirtualOffsetFromPointer(wt)), cur->spr.LR);
++		}
++		if (c.idling && c.waker.empty())
++			c.waker = w;
++		if (isPrim)
++		{
++			ThrState& ts = s_thr[t];
++			if (ts.waker.empty())
++				ts.waker = w;
++		}
++	}
++
++	void dump()
++	{
++		uint64 now = cprof::ticks();
++		double wallMs = (double)(now - s_lastDump) * 1000.0 / (double)cprof::freq();
++		double tk2ms = 1000.0 / (double)cprof::freq();
++		s_lastDump = now;
++		for (uint32 core = 0; core < 3; core++)
++		{
++			CoreState& c = s_core[core];
++			uint64 runTotal = 0;
++			for (auto& it : c.runBy) runTotal += it.second.ticks;
++			cemuLog_log(LogType::Force, "[corestats] core{} wall={:.0f}ms run={:.1f}% idle={:.1f}%", core, wallMs, 100.0 * runTotal * tk2ms / wallMs, 100.0 * c.idleTotal * tk2ms / wallMs);
++			std::vector<std::pair<uint64, MPTR>> runs;
++			for (auto& it : c.runBy) runs.emplace_back(it.second.ticks, it.first);
++			std::sort(runs.rbegin(), runs.rend());
++			if (!runs.empty())
++				s_primary[core] = runs[0].second;
++			for (size_t i = 0; i < runs.size() && i < 8; i++)
++				cemuLog_log(LogType::Force, "[corestats]   run {:5.1f}% {}", 100.0 * runs[i].first * tk2ms / wallMs, guestThreadName(runs[i].second));
++			std::vector<std::pair<uint64, decltype(c.idleBy)::const_iterator>> idles;
++			for (auto it = c.idleBy.cbegin(); it != c.idleBy.cend(); ++it) idles.emplace_back(it->second.ticks, it);
++			std::sort(idles.begin(), idles.end(), [](auto& a, auto& b) { return a.first > b.first; });
++			for (size_t i = 0; i < idles.size() && i < 14; i++)
++			{
++				auto& k = idles[i].second->first;
++				cemuLog_log(LogType::Force, "[corestats]   idle {:5.1f}% n={} after {} blocked in {} lr={:08x} woken by {}", 100.0 * idles[i].first * tk2ms / wallMs, idles[i].second->second.count,
++					guestThreadName(std::get<0>(k)), symAt(std::get<1>(k)), std::get<2>(k), std::get<3>(k));
++			}
++			c.runBy.clear();
++			c.idleBy.clear();
++			c.idleTotal = 0;
++			if (c.runStart) c.runStart = now; // keep current slice but restart its accounting
++		}
++	}
++}
++
++namespace cprof
++{
++	void latteFrameTick()
++	{
++		static uint64 s_last = 0;
++		static uint64 s_lastVals[L_COUNT]{};
++		static uint32 s_frames = 0;
++		static uint64 s_lastCpuNs = 0;
++		if (!enabled())
++			return;
++		uint64 now = ticks();
++		static uint64 s_prevSwap = 0;
++		static uint32 s_hist[16]{}; // swap-to-swap interval histogram, 5 ms buckets
++		if (s_prevSwap)
++		{
++			uint64 b = (now - s_prevSwap) * 200 / freq();
++			s_hist[b < 15 ? b : 15]++;
++		}
++		s_prevSwap = now;
++		s_frames++;
++		if (!s_last) { s_last = now; return; }
++		if (now - s_last < freq() * 5)
++			return;
++		double tk2ms = 1000.0 / (double)freq();
++		double wallMs = (now - s_last) * tk2ms;
++		timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++		uint64 cpuNs = (uint64)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++		std::string line = fmt::format("[lattestats] frames={} wall/frame={:.2f}ms latteCpu={:.1f}%", s_frames, wallMs / s_frames, s_lastCpuNs ? 100.0 * (cpuNs - s_lastCpuNs) / 1e6 / wallMs : 0.0);
++		for (int i = 0; i < L_COUNT; i++)
++		{
++			uint64 v = g_latte[i].load(std::memory_order_relaxed);
++			line += fmt::format(" {}={:.2f}ms/f", latteCatName(i), (v - s_lastVals[i]) * tk2ms / s_frames);
++			s_lastVals[i] = v;
++		}
++		line += " hist5ms:";
++		for (int i = 0; i < 16; i++) { line += fmt::format(" {}", s_hist[i]); s_hist[i] = 0; }
++		cemuLog_log(LogType::Force, "{}", line);
++		s_lastCpuNs = cpuNs;
++		s_last = now;
++		s_frames = 0;
++	}
++}
++
+ namespace coreinit
+ {
+ #ifdef __arm64__
+@@ -775,6 +1021,8 @@ namespace coreinit
+ 			g_coreRunQueue.GetPtr()[i].addThread(thread, thread->linkRun + i);
+ 			thread->currentRunQueue[i] = (g_coreRunQueue.GetPtr() + i);
+ 			g_coreRunQueueThreadCount[i].increment();
++			if (cprof::enabled())
++				cstat::onReady(thread, i);
+ 		}
+ 	}
+ 
+@@ -1262,12 +1510,27 @@ namespace coreinit
+ 				if (nextThread)
+ 				{
+ 					cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
++					if (cprof::enabled())
++						cstat::idleEnd(coreIndex, nextThread);
+ 					__OSSwitchToThreadFiber(nextThread, coreIndex);
+ 				}
+ 				__OSUnlockScheduler();
+ 			}
+ 			if (isMainCore)
+ 			{
++				// CEMU_IDLE_THROTTLE_US=N: while idle, poll system events (AX/alarms, which take the timer spinlock) at most every N us
++				static const uint64 s_idleThrottle = []() -> uint64 { const char* e = getenv("CEMU_IDLE_THROTTLE_US"); return e ? (uint64)atoi(e) * cprof::freq() / 1000000ull : 0; }();
++				if (s_idleThrottle && g_coreRunQueueThreadCount[coreIndex].isZero())
++				{
++					static thread_local uint64 s_lastEvents = 0;
++					uint64 now = cprof::ticks();
++					if (now - s_lastEvents < s_idleThrottle)
++					{
++						_mm_pause();
++						continue;
++					}
++					s_lastEvents = now;
++				}
+ 				__OSCheckSystemEvents();
+ 				if(g_isMulticoreMode == false)
+ 					coreIndex = (coreIndex + 1) % 3;
+@@ -1292,6 +1555,8 @@ namespace coreinit
+ 		//if (ppcInterpreterCurrentInstance)
+ 		//	debug_printf("Core %d store thread %08x (t = %d)\n", hostThread->ppcInstance.sprNew.UPIR, memory_getVirtualOffsetFromPointer(hostThread->thread), t_assignedCoreIndex);
+ 
++		if (cprof::enabled() && g_isMulticoreMode)
++			cstat::switchOut(t_assignedCoreIndex, hostThread->m_thread, &hostThread->ppcInstance);
+ 		// store context of current thread
+ 		__OSStoreThread(OSGetCurrentThread(), &hostThread->ppcInstance);
+ 		cemu_assert_debug(PPCInterpreter_getCurrentInstance() == nullptr);
+@@ -1319,14 +1584,22 @@ namespace coreinit
+ 		// find next thread to run
+ 		// for main thread we force switching to the idle loop since it calls __OSCheckSystemEvents()
+ 		if(isMainThread)
++		{
++			if (cprof::enabled() && g_isMulticoreMode)
++				cstat::idleBegin(t_assignedCoreIndex);
+ 			Fiber::Switch(*g_idleLoopFiber[t_assignedCoreIndex]);
++		}
+ 		else if (OSThread_t* nextThread = __OSGetNextRunableThread(coreIndex))
+ 		{
+ 			cemu_assert_debug(nextThread->state == OSThread_t::THREAD_STATE::STATE_RUNNING);
++			if (cprof::enabled() && g_isMulticoreMode)
++				cstat::runBegin(t_assignedCoreIndex, memory_getVirtualOffsetFromPointer(nextThread));
+ 			__OSSwitchToThreadFiber(nextThread, coreIndex);
+ 		}
+ 		else
+ 		{
++			if (cprof::enabled() && g_isMulticoreMode)
++				cstat::idleBegin(t_assignedCoreIndex);
+ 			Fiber::Switch(*g_idleLoopFiber[t_assignedCoreIndex]);
+ 		}
+ 
+diff --git a/src/Cafe/OS/libs/gx2/GX2_Command.cpp b/src/Cafe/OS/libs/gx2/GX2_Command.cpp
+index d12bf21..1ed8653 100644
+--- a/src/Cafe/OS/libs/gx2/GX2_Command.cpp
++++ b/src/Cafe/OS/libs/gx2/GX2_Command.cpp
+@@ -317,6 +317,17 @@ namespace GX2
+ 
+ 	bool GX2WaitTimeStamp(uint64 tsWait)
+ 	{
++		// CEMU_WAITTS_LR=<hex guest LR> + CEMU_WAITTS_LAG=<n>: for GX2WaitTimeStamp calls returning to that address
++		// (BetterVR's left-eye waitForLastSubmittedTimeStamp), wait only until timestamp (tsWait - n) has retired.
++		// n=0 is unchanged behaviour, a huge n skips the wait (cpu agent experiment, default off)
++		static const uint32 s_lagLR = [] { const char* e = getenv("CEMU_WAITTS_LR"); return e ? (uint32)strtoul(e, nullptr, 16) : 0u; }();
++		static const uint64 s_lag = [] { const char* e = getenv("CEMU_WAITTS_LAG"); return e ? (uint64)strtoull(e, nullptr, 10) : 0ull; }();
++		if (s_lagLR)
++		{
++			PPCInterpreter_t* cpu = PPCInterpreter_getCurrentInstance();
++			if (cpu && cpu->spr.LR == s_lagLR)
++				tsWait = tsWait > s_lag ? tsWait - s_lag : 0;
++		}
+ 		// handle GPU timeout here? But for now we timeout after 60 seconds
+ 		TCL::TCLWaitTimestamp(TCL::TCLTimestampId::TIMESTAMP_LAST_BUFFER_RETIRED, tsWait, Espresso::TIMER_CLOCK * 60);
+ 		return true;
+diff --git a/src/Cafe/OS/libs/gx2/GX2_Query.cpp b/src/Cafe/OS/libs/gx2/GX2_Query.cpp
+index f79cf70..4f05012 100644
+--- a/src/Cafe/OS/libs/gx2/GX2_Query.cpp
++++ b/src/Cafe/OS/libs/gx2/GX2_Query.cpp
+@@ -98,8 +98,19 @@ namespace GX2
+ 
+ 	uint32 GX2QueryGetOcclusionResult(GX2Query* query, uint64be* resultOut)
+ 	{
++		// CEMU_OCCLUSION_FORCE_VISIBLE=1: every occlusion query is finished and visible (diagnostic for culling issues)
++		static const bool s_forceVisible = [] { const char* e = getenv("CEMU_OCCLUSION_FORCE_VISIBLE"); return e && e[0] == '1'; }();
++		static std::atomic<uint32> s_calls{0}, s_notReady{0};
++		if ((++s_calls % 20000) == 0)
++			cemuLog_log(LogType::Force, "GX2QueryGetOcclusionResult: {} calls, {} not ready", s_calls.load(), s_notReady.load());
++		if (s_forceVisible)
++		{
++			*resultOut = 0x100000;
++			return GX2_TRUE;
++		}
+ 		if (query->reg[LATTE_GC_NUM_RB * 4 + 1] == _swapEndianU32('OCPU') && query->reg[LATTE_GC_NUM_RB * 4 + 0] == 0)
+ 		{
++			s_notReady++;
+ 			// CPU query result not ready
+ 			return GX2_FALSE;
+ 		}
+diff --git a/src/Cafe/OS/libs/snd_core/ax_out.cpp b/src/Cafe/OS/libs/snd_core/ax_out.cpp
+index 6cb1599..83fea2a 100644
+--- a/src/Cafe/OS/libs/snd_core/ax_out.cpp
++++ b/src/Cafe/OS/libs/snd_core/ax_out.cpp
+@@ -500,7 +500,21 @@ namespace snd_core
+ 		static auto s_ax_interval_timer = now_cached() - kWaitDuration;
+ 		static auto s_last_check = now_cached();
+ 
+-		const auto now = now_cached();
++		// CEMU_FAST_CLOCK=1: read the ARM generic timer directly instead of clock_gettime (this runs in the main core idle spin)
++		static const bool s_fastClock = []() { const char* e = getenv("CEMU_FAST_CLOCK"); return e && e[0] == '1'; }();
++		std::chrono::high_resolution_clock::time_point now;
++#if defined(__aarch64__)
++		if (s_fastClock)
++		{
++			static const uint64 s_freq = []() { uint64 v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }();
++			static const uint64 s_t0 = __rdtsc();
++			static const auto s_base = now_cached();
++			const uint64 dt = __rdtsc() - s_t0;
++			now = s_base + std::chrono::nanoseconds((uint64)(((unsigned __int128)dt * 1000000000ull) / s_freq));
++		}
++		else
++#endif
++			now = now_cached();
+ 		const auto diff = (now - s_ax_interval_timer);
+ 
+ 		if (diff < wait_duration)
+diff --git a/src/Common/CemuProf.h b/src/Common/CemuProf.h
+new file mode 100644
+index 0000000..c13829f
+--- /dev/null
++++ b/src/Common/CemuProf.h
+@@ -0,0 +1,64 @@
++#pragma once
++// Lightweight, env-gated profiling counters for the ARM Frame build (cpu agent, 2026-10-28).
++// CEMU_CORE_STATS=1 enables: per-core idle/blocker attribution (coreinit_Thread.cpp) and LatteThread wait accounting.
++// All timestamps use the ARM generic timer (cntvct_el0), which is what __rdtsc() maps to on aarch64.
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++
++namespace cprof
++{
++	inline uint64_t ticks()
++	{
++#if defined(__aarch64__)
++		uint64_t t;
++		asm volatile("mrs %0, cntvct_el0" : "=r"(t));
++		return t;
++#else
++		return __rdtsc();
++#endif
++	}
++
++	inline uint64_t freq()
++	{
++#if defined(__aarch64__)
++		static uint64_t f = []() { uint64_t v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }();
++		return f;
++#else
++		return 1000000000ull; // not meaningful on x86; profiling is meant for the ARM build
++#endif
++	}
++
++	inline bool enabled()
++	{
++		static const bool on = []() { const char* e = getenv("CEMU_CORE_STATS"); return e && e[0] == '1'; }();
++		return on;
++	}
++
++	enum LatteCat
++	{
++		L_RING_IDLE,   // ring buffer empty: GPU thread waits for the guest CPU to submit commands
++		L_FENCE,       // WAIT_REG_MEM: GPU thread waits for a guest memory value
++		L_FLIP,        // HLE wait-for-flip
++		L_VKFENCE,     // vkWaitForFences on a submitted command buffer (waits for the real GPU)
++		L_SWAP,        // VulkanRenderer::SwapBuffers total (includes present / VR layer)
++		L_READBACK,    // texture readback / async waits
++		L_COUNT
++	};
++	inline std::atomic<uint64_t> g_latte[L_COUNT]{};
++	inline const char* latteCatName(int i)
++	{
++		static const char* n[] = {"ringIdle", "fenceWait", "flipWait", "vkFence", "swap", "readback"};
++		return n[i];
++	}
++
++	struct LatteScope
++	{
++		int cat; uint64_t t0;
++		LatteScope(int c) : cat(c), t0(enabled() ? ticks() : 0) {}
++		~LatteScope() { if (t0) g_latte[cat].fetch_add(ticks() - t0, std::memory_order_relaxed); }
++	};
++
++	// called once per frame from LatteThread (swap); logs every ~5 s
++	void latteFrameTick();
++}
+diff --git a/src/Common/precompiled.h b/src/Common/precompiled.h
+index e037395..5c86127 100644
+--- a/src/Common/precompiled.h
++++ b/src/Common/precompiled.h
+@@ -321,7 +321,7 @@ inline uint64 _udiv128(uint64 highDividend, uint64 lowDividend, uint64 divisor,
+     #if BOOST_OS_WINDOWS
+         #define DLLEXPORT __attribute__((dllexport))
+     #else
+-        #define DLLEXPORT
++        #define DLLEXPORT __attribute__((visibility("default")))
+     #endif
+ #else
+     #error No definition for DLLEXPORT
+@@ -357,7 +357,8 @@ FORCE_INLINE int BSF(uint32 v) // returns index of first bit set, counting from
+ 
+ inline void _mm_pause()
+ {
+-    asm volatile("yield");
++    // "memory" clobber: spin-wait loops must re-read shared state on every iteration
++    asm volatile("yield" ::: "memory");
+ }
+ 
+ inline uint64 __rdtsc()
