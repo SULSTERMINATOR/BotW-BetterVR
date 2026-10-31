@@ -970,13 +970,26 @@ std::vector<XrCompositionLayerQuad> RND_Renderer::Layer2D::FinishRendering(XrTim
     // todo: change space to head space if we want to follow the head
     const float LAYER_SIZE = wristPlacementActive ? GetSettings().wristHudSize : GetSettings().hudSize;
 
+    // Steam Frame: lock the HUD/menus to the view (XR VIEW space). Placing them in stage space from the game's
+    // low-rate eye poses made them visibly jitter. BETTERVR_LINUX_HUD_VIEWLOCK=0 restores the placement above.
+    static const bool s_hudViewLock = [] {
+        const char* e = std::getenv("BETTERVR_LINUX_HUD_VIEWLOCK");
+        return !(e && e[0] == '0');
+    }();
+    XrSpace layerSpace = VRManager::instance().XR->m_stageSpace;
+    if (s_hudViewLock && !wristPlacementActive && VRManager::instance().XR->m_headSpace != XR_NULL_HANDLE) {
+        layerSpace = VRManager::instance().XR->m_headSpace;
+        layerPose.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+        layerPose.position = { 0.0f, 0.0f, -DISTANCE };
+    }
+
     std::vector<XrCompositionLayerQuad> layers;
 
     // clang-format off
     layers.push_back({
         .type = XR_TYPE_COMPOSITION_LAYER_QUAD,
         .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-        .space = VRManager::instance().XR->m_stageSpace,
+        .space = layerSpace,
         .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
         .subImage = {
             .swapchain = this->m_swapchain->GetHandle(),
