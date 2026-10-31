@@ -3,6 +3,20 @@
 namespace VRLayer {
     void LogDeviceFaultInfo();
 
+    // Device B (RND_Vulkan2) is a second, independent VkInstance/VkDevice, but since it's
+    // created via the real vkGetInstanceProcAddr (see vulkan2.cpp), every globally-active
+    // Vulkan layer - this one included - applies to it too, same as any other Vulkan app.
+    // None of this layer's hooks are meant to apply to its OWN internal presenter device:
+    // beyond being pointless, some of them actively break it (recursively re-entering the
+    // still-under-construction VRManager singleton; deadlocking on lockImageResolutions
+    // when Device B's own swapchain image creation reenters CreateImage from inside the
+    // framebuffer.cpp code that's already holding that same mutex while constructing
+    // Layer3D/Layer2D - both confirmed live against a real Quest 3+WiVRn). Every
+    // VkInstanceOverrides/VkDeviceOverrides hook below checks these first and passes
+    // straight through for Device B.
+    bool IsDeviceBInstance(VkInstance instance);
+    bool IsDeviceBDevice(VkDevice device);
+
     class VkInstanceOverrides {
     public:
         static VkResult CreateInstance(PFN_vkCreateInstance createInstanceFunc, const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance);

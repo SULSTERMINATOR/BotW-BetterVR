@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <thread>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -23,10 +24,10 @@
 #include <algorithm>
 #include <cctype>
 
+#ifdef _WIN32
 #include <Windows.h>
 #include <winrt/base.h>
 #include <shellapi.h>
-
 
 // These macros mess with some of Vulkan's functions
 #undef ERROR
@@ -34,6 +35,8 @@
 #undef CreateSemaphore
 
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
+
 #define VK_NO_PROTOTYPES
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan_core.h>
@@ -42,6 +45,7 @@
 #define VKROOTS_NEGOTIATION_INTERFACE VRLayer_NegotiateLoaderLayerInterfaceVersion
 #include "vkroots.h"
 
+#ifdef _WIN32
 // D3D12 includes
 #include <d3d12.h>
 #include <D3Dcompiler.h>
@@ -55,10 +59,43 @@
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
+#else
+// Linux: placeholder for the Win32 window-handle type used by a few places (window
+// focus checks, window enumeration in InitWindowHandles). Real Wayland/X11 window
+// discovery isn't implemented yet - this just lets everything compile with a value
+// that's always "no window found" until that's built.
+using HWND = void*;
+
+// Linux equivalents of a couple of small Win32 APIs used by the gameplay hooks
+// (arrow-shoot-decision timing in bow.cpp, camera.cpp's debug env var check).
+inline uint64_t GetTickCount64() {
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+inline unsigned long GetEnvironmentVariableA(const char* name, char* buffer, unsigned long size) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return 0;
+    }
+    size_t len = std::strlen(value);
+    if (buffer != nullptr && size > 0) {
+        std::strncpy(buffer, value, size);
+    }
+    return (unsigned long)len;
+}
+#endif
 
 // OpenXR includes
+#ifdef _WIN32
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D12
+#else
+// Linux: no XR_USE_PLATFORM_* define needed - this layer never creates its own OS
+// window/surface (Cemu already owns that), and XR_KHR_vulkan_enable2's device
+// creation path doesn't require one. Confirmed working this way in the standalone
+// interop proof-of-concept (vk-vk-openxr-test) against WiVRn on this exact machine.
+#define XR_USE_GRAPHICS_API_VULKAN
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -82,6 +119,7 @@ using Microsoft::WRL::ComPtr;
 #include <glm/gtx/norm.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include <glm/gtx/euler_angles.hpp>
+#include <glm/gtx/quaternion.hpp>
 #undef GLM_ENABLE_EXPERIMENTAL
 
 #define ENABLE_VK_ROBUSTNESS 0
@@ -163,14 +201,44 @@ inline uint32_t stringToHash(const char* str) {
     return hash;
 }
 
+#ifdef _WIN32
 inline std::string wcharToUtf8(const wchar_t* wstr) {
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
     std::string str(size_needed, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &str[0], size_needed, nullptr, nullptr);
     return str;
 }
+#else
+// Linux: wchar_t is 4 bytes (UTF-32) here, unlike Windows' 2-byte UTF-16, so this is
+// a straightforward UTF-32 -> UTF-8 encoder rather than a WideCharToMultiByte call.
+inline std::string wcharToUtf8(const wchar_t* wstr) {
+    std::string out;
+    for (const wchar_t* p = wstr; *p; ++p) {
+        uint32_t cp = (uint32_t)*p;
+        if (cp <= 0x7F) {
+            out += (char)cp;
+        }
+        else if (cp <= 0x7FF) {
+            out += (char)(0xC0 | (cp >> 6));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+        else if (cp <= 0xFFFF) {
+            out += (char)(0xE0 | (cp >> 12));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+        else {
+            out += (char)(0xF0 | (cp >> 18));
+            out += (char)(0x80 | ((cp >> 12) & 0x3F));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    return out;
+}
+#endif
 
-#define PADDED_BYTES(from, up) uint8_t byte_##from##[ ## (up-from+0x04) ## ]
+#define PADDED_BYTES(from, up) uint8_t byte_##from[(up) - (from) + 0x04]
 
 template<class T, template<class...> class U>
 inline constexpr bool is_instance_of_v = std::false_type{};
@@ -281,6 +349,18 @@ inline T swapEndianness(T val) {
 struct BETypeCompatible {
 };
 
+// Distinct empty tag for compound BE-wrapper types (BEVec3 etc.) that themselves contain
+// BEType<T> members. On the Itanium C++ ABI (GCC/Clang), two *same-typed* empty base-class
+// subobjects with no subobject relationship to each other (e.g. a BEVec3's own BETypeCompatible
+// base and one of its BEType<float> members' nested BETypeCompatible base) aren't allowed to
+// share an address, so the compiler pads the outer struct to give them distinct ones - silently
+// growing e.g. BEVec3 from a tight 12 bytes to 16. MSVC's ABI doesn't apply that rule and stays
+// at 12 either way. Using a different (but still empty) tag type for the outer struct avoids the
+// same-type collision entirely (the standard explicitly allows same-address zero-size subobjects
+// of *different* types), which keeps GCC's layout tight and matches MSVC exactly.
+struct BEAggregateCompatible {
+};
+
 template<typename T>
 struct BEType : BETypeCompatible {
     T val;
@@ -339,9 +419,9 @@ struct BEType : BETypeCompatible {
 
 
 template<typename T>
-inline constexpr bool is_BEType_v = std::is_base_of_v<BETypeCompatible, T>;
+inline constexpr bool is_BEType_v = std::is_base_of_v<BETypeCompatible, T> || std::is_base_of_v<BEAggregateCompatible, T>;
 
-struct BEVec2 : BETypeCompatible {
+struct BEVec2 : BEAggregateCompatible {
     BEType<float> x;
     BEType<float> y;
 
@@ -354,7 +434,7 @@ struct BEVec2 : BETypeCompatible {
     }
 };
 
-struct BEVec3 : BETypeCompatible {
+struct BEVec3 : BEAggregateCompatible {
     BEType<float> x;
     BEType<float> y;
     BEType<float> z;
@@ -382,7 +462,7 @@ struct BEVec3 : BETypeCompatible {
     }
 };
 
-struct BEMatrix34 : BETypeCompatible {
+struct BEMatrix34 : BEAggregateCompatible {
     BEType<float> x_x;
     BEType<float> y_x;
     BEType<float> z_x;
@@ -472,7 +552,7 @@ struct BEMatrix34 : BETypeCompatible {
     }
 };
 
-struct BEMatrix44 : BETypeCompatible {
+struct BEMatrix44 : BEAggregateCompatible {
     BEType<float> a00;
     BEType<float> a01;
     BEType<float> a02;

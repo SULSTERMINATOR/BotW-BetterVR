@@ -5,6 +5,16 @@
 
 static bool s_deviceFaultLoggingEnabled = false;
 
+// See the comment on IsDeviceBInstance/IsDeviceBDevice in layer.h for why these need to
+// exist at all.
+static VkInstance s_deviceBInstance = VK_NULL_HANDLE;
+static VkDevice s_deviceBDevice = VK_NULL_HANDLE;
+
+namespace VRLayer {
+    bool IsDeviceBInstance(VkInstance instance) { return instance == s_deviceBInstance; }
+    bool IsDeviceBDevice(VkDevice device) { return device == s_deviceBDevice; }
+}
+
 #ifdef _DEBUG
 static VkInstance s_debugMessengerInstance = VK_NULL_HANDLE;
 static VkDebugUtilsMessengerEXT s_debugMessenger = VK_NULL_HANDLE;
@@ -36,6 +46,28 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL VulkanDebugUtilsMessengerCallback(
 VkResult VRLayer::VkInstanceOverrides::CreateInstance(PFN_vkCreateInstance createInstanceFunc, const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
     if (!createInstanceFunc || !pCreateInfo || !pInstance) {
         return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // Device B (RND_Vulkan2) creates its own separate VkInstance via
+    // xrCreateVulkanInstanceKHR, using the real vkGetInstanceProcAddr (see vulkan2.cpp) -
+    // which means the real Vulkan loader applies every globally-active layer to it too,
+    // including this one. If this hook ran its normal logic on that instance, the
+    // "VRManager::instance().vkVersion = ..." line below would recursively re-enter the
+    // VRManager Meyer's-singleton constructor from inside its own not-yet-finished
+    // construction (Device B's instance is created *during* that construction, in
+    // RND_Vulkan2's constructor) - a self-deadlock on the function-local static's
+    // init guard. Confirmed live against a real Quest 3+WiVRn: the process hung
+    // indefinitely, every single time, right where xrCreateVulkanInstanceKHR's inner
+    // vkCreateInstance call reached this exact hook. Device B's instance is identified
+    // by the distinct application name vulkan2.cpp gives it, and just needs to be
+    // created normally - none of this layer's own VR-hooking logic applies to it.
+    if (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName &&
+        std::strcmp(pCreateInfo->pApplicationInfo->pApplicationName, "BetterVR_Layer_DeviceB") == 0) {
+        VkResult result = createInstanceFunc(pCreateInfo, pAllocator, pInstance);
+        if (result == VK_SUCCESS) {
+            s_deviceBInstance = *pInstance;
+        }
+        return result;
     }
 
     VkInstanceCreateInfo modifiedCreateInfo = *pCreateInfo;
@@ -119,54 +151,80 @@ VkResult VRLayer::VkInstanceOverrides::CreateInstance(PFN_vkCreateInstance creat
 }
 
 
+// Linux port note: the Windows version matched Cemu's hooked VkPhysicalDevice to
+// OpenXR's chosen GPU by comparing D3D12 LUIDs (queried via VkPhysicalDeviceIDProperties
+// deviceLUID). LUIDs are a Windows-only concept, so this compares the portable
+// equivalent instead: VkPhysicalDeviceIDProperties::deviceUUID.
+//
+// An earlier version of this tried calling xrGetVulkanGraphicsDevice2KHR directly on
+// Cemu's own instance (right here), on the assumption it works like the older, more
+// permissive xrGetVulkanGraphicsDeviceKHR (any app-created VkInstance accepted). It
+// doesn't: XR_KHR_vulkan_enable2's "2" entry point requires the VkInstance to have
+// itself been created via xrCreateVulkanInstanceKHR, which Cemu's own instance never
+// is. Calling it with an arbitrary instance reliably failed with
+// XR_ERROR_VALIDATION_FAILURE against WiVRn (confirmed live against a real Quest 3 -
+// the runtime's own internal per-instance Vulkan state was never populated for an
+// instance it didn't create itself). Device B (RND_Vulkan2) already legitimately owns
+// an xrCreateVulkanInstanceKHR-created instance and already knows its own physical
+// device correctly - comparing UUIDs against that is both correct per the spec and
+// exactly what the UUID field exists for.
 VkResult VRLayer::VkInstanceOverrides::EnumeratePhysicalDevices(const vkroots::VkInstanceDispatch& pDispatch, VkInstance instance, uint32_t* pPhysicalDeviceCount, VkPhysicalDevice* pPhysicalDevices) {
-    // Proceed to get all devices
+    // Same reasoning as the Device B bypasses in CreateInstance/CreateDevice above:
+    // xrGetVulkanGraphicsDevice2KHR's own implementation enumerates physical devices on
+    // Device B's instance internally, which - same as instance/device creation - goes
+    // through every globally-active layer including this one.
+    if (instance == s_deviceBInstance) {
+        return pDispatch.EnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
+    }
+
     uint32_t internalCount = 0;
     checkVkResult(pDispatch.EnumeratePhysicalDevices(instance, &internalCount, nullptr), "Failed to retrieve number of vulkan physical devices!");
     std::vector<VkPhysicalDevice> internalDevices(internalCount);
     checkVkResult(pDispatch.EnumeratePhysicalDevices(instance, &internalCount, internalDevices.data()), "Failed to retrieve vulkan physical devices!");
 
+    std::array<uint8_t, VK_UUID_SIZE> targetUuid = VRManager::instance().VK2->GetPhysicalDeviceUUID();
     VkPhysicalDevice matchedDevice = VK_NULL_HANDLE;
-    VkPhysicalDevice fallbackDevice = VK_NULL_HANDLE;
-
     for (const VkPhysicalDevice& device : internalDevices) {
-        VkPhysicalDeviceIDProperties deviceId = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
-        VkPhysicalDeviceProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-        properties.pNext = &deviceId;
-        pDispatch.GetPhysicalDeviceProperties2(device, &properties);
-
-        if (deviceId.deviceLUIDValid && memcmp(&VRManager::instance().XR->m_capabilities.adapter, deviceId.deviceLUID, VK_LUID_SIZE) == 0) {
+        VkPhysicalDeviceIDProperties idProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+        VkPhysicalDeviceProperties2 props2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idProps };
+        pDispatch.GetPhysicalDeviceProperties2(device, &props2);
+        if (std::memcmp(idProps.deviceUUID, targetUuid.data(), VK_UUID_SIZE) == 0) {
             matchedDevice = device;
             break;
         }
+    }
 
-        // Keep track of the first discrete GPU as fallback for drivers that don't report valid LUIDs
-        if (fallbackDevice == VK_NULL_HANDLE && properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-            fallbackDevice = device;
+    // Fall back to the first discrete GPU, then the first device at all, matching
+    // the original's fallback behavior for the (here, unlikely) case OpenXR can't
+    // resolve a device for this instance.
+    VkPhysicalDevice fallbackDevice = VK_NULL_HANDLE;
+    if (matchedDevice == VK_NULL_HANDLE) {
+        for (const VkPhysicalDevice& device : internalDevices) {
+            VkPhysicalDeviceProperties props = {};
+            pDispatch.GetPhysicalDeviceProperties(device, &props);
+            if (fallbackDevice == VK_NULL_HANDLE && props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                fallbackDevice = device;
+            }
         }
     }
 
-    // Use matched device, or fallback to first discrete GPU if no LUID match found
     VkPhysicalDevice selectedDevice = matchedDevice != VK_NULL_HANDLE ? matchedDevice : fallbackDevice;
-
-    // Last resort: use first available device
     if (selectedDevice == VK_NULL_HANDLE && !internalDevices.empty()) {
         selectedDevice = internalDevices[0];
-        Log::print<WARNING>("No device matched OpenXR LUID and no discrete GPU found, using first available device");
+        Log::print<WARNING>("OpenXR couldn't resolve a matching device and no discrete GPU found, using first available device");
     }
 
     if (selectedDevice != VK_NULL_HANDLE) {
         VkPhysicalDeviceProperties props = {};
         pDispatch.GetPhysicalDeviceProperties(selectedDevice, &props);
-        const bool luidMatched = matchedDevice != VK_NULL_HANDLE;
-        Log::print<INFO>("Selected Vulkan GPU: '{}' (vendor=0x{:04X}, device=0x{:04X}, type={}, driver={}.{}.{}, api={}.{}.{}) | LUID match: {}",
+        Log::print<INFO>("Selected Vulkan GPU: '{}' (vendor=0x{:04X}, device=0x{:04X}, type={}, driver={}.{}.{}, api={}.{}.{}) | OpenXR match: {}",
             props.deviceName,
             props.vendorID,
             props.deviceID,
             (int)props.deviceType,
             VK_VERSION_MAJOR(props.driverVersion), VK_VERSION_MINOR(props.driverVersion), VK_VERSION_PATCH(props.driverVersion),
             VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion),
-            luidMatched ? "yes" : "no");
+            selectedDevice == matchedDevice ? "yes" : "no");
 
         if (pPhysicalDevices != nullptr) {
             if (*pPhysicalDeviceCount < 1) {
@@ -187,48 +245,33 @@ VkResult VRLayer::VkInstanceOverrides::EnumeratePhysicalDevices(const vkroots::V
     return VK_SUCCESS;
 }
 
-// Some layers (OBS vulkan layer) will skip the vkEnumeratePhysicalDevices hook
-// Therefor we also override vkGetPhysicalDeviceProperties to make any non-compatible VkPhysicalDevice use Vulkan 1.0 which Cemu won't list due to it being too low
+// Some layers (OBS vulkan layer) will skip the vkEnumeratePhysicalDevices hook.
+// Note: unlike the LUID check this replaces, this can't cheaply tell "is this the
+// OpenXR device" from properties alone anymore (no per-instance context here) - see
+// the comment on GetPhysicalDeviceQueueFamilyProperties below for why this is left
+// as a no-op rather than guessed at.
 void VRLayer::VkInstanceOverrides::GetPhysicalDeviceProperties(const vkroots::VkPhysicalDeviceDispatch& pDispatch, VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties* pProperties) {
-    // Do original query
     pDispatch.GetPhysicalDeviceProperties(physicalDevice, pProperties);
-
-    // Do a seperate internal query to make sure that we also query the LUID
-    {
-        VkPhysicalDeviceIDProperties deviceId = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
-        VkPhysicalDeviceProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-        properties.pNext = &deviceId;
-        pDispatch.GetPhysicalDeviceProperties2(physicalDevice, &properties);
-
-        if (deviceId.deviceLUIDValid && memcmp(&VRManager::instance().XR->m_capabilities.adapter, deviceId.deviceLUID, VK_LUID_SIZE) != 0) {
-            pProperties->apiVersion = VK_API_VERSION_1_0;
-        }
-    }
 }
 
-// Some layers (OBS vulkan layer) will skip the vkEnumeratePhysicalDevices hook
-// Therefor we also override vkGetPhysicalDeviceQueueFamilyProperties to make any non-VR-compatible VkPhysicalDevice have 0 queues
+// Some layers (OBS vulkan layer) will skip the vkEnumeratePhysicalDevices hook.
+// TODO(linux-port): the original used the LUID comparison here too, to zero out
+// queues on non-VR-compatible devices as a defense against exactly the OBS-layer
+// bypass case. xrGetVulkanGraphicsDevice2KHR needs a VkInstance to resolve a
+// physical device, but this hook only receives a VkPhysicalDevice - the instance
+// isn't in scope here in vkroots' per-physical-device dispatch. Left as a
+// pass-through for now (the EnumeratePhysicalDevices override above is the primary,
+// working path); revisit if an OBS-layer-bypass scenario actually surfaces.
 void VRLayer::VkInstanceOverrides::GetPhysicalDeviceQueueFamilyProperties(const vkroots::VkPhysicalDeviceDispatch& pDispatch, VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties) {
-    // Check whether this VkPhysicalDevice matches the LUID that OpenXR returns
-    VkPhysicalDeviceIDProperties deviceId = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
-    VkPhysicalDeviceProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-    properties.pNext = &deviceId;
-    pDispatch.GetPhysicalDeviceProperties2(physicalDevice, &properties);
-
-    if (deviceId.deviceLUIDValid && memcmp(&VRManager::instance().XR->m_capabilities.adapter, deviceId.deviceLUID, VK_LUID_SIZE) != 0) {
-        *pQueueFamilyPropertyCount = 0;
-        return;
-    }
-
     return pDispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
 }
 
 const std::vector<std::string> additionalDeviceExtensions = {
     VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
     VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
 #if ENABLE_VK_DEVICE_FAULT
     VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
@@ -240,6 +283,18 @@ const std::vector<std::string> additionalDeviceExtensions = {
 };
 
 VkResult VRLayer::VkInstanceOverrides::CreateDevice(const vkroots::VkPhysicalDeviceDispatch& pDispatch, VkPhysicalDevice gpu, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
+    // Same reasoning as the Device B bypass in CreateInstance above: Device B creates its
+    // own VkDevice via xrCreateVulkanDeviceKHR, which goes through every globally-active
+    // layer including this one. Letting this hook's normal logic run on it would try to
+    // touch VRManager::instance() from inside its own not-yet-finished construction again.
+    if (pDispatch.pInstanceDispatch->Instance == s_deviceBInstance) {
+        VkResult result = pDispatch.CreateDevice(gpu, pCreateInfo, pAllocator, pDevice);
+        if (result == VK_SUCCESS) {
+            s_deviceBDevice = *pDevice;
+        }
+        return result;
+    }
+
     // Query available extensions for this device
     uint32_t extensionCount = 0;
     pDispatch.EnumerateDeviceExtensionProperties(gpu, nullptr, &extensionCount, nullptr);

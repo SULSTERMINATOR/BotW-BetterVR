@@ -11,15 +11,23 @@ It currently supports the following features:
 * Large mod compatibility. BetterVR only modifies the code and no game data. Most other mods should be compatible.
 * Optional third-person mode.
 
+> [!NOTE]
+> **This fork adds an unofficial, AI-assisted Linux port**, confirmed working on one
+> specific setup (EndeavourOS + WiVRn + Quest 3). It is not made or maintained by
+> Crementif, and is not actively monitored - use at your own risk. If you're on Linux,
+> see [LINUX.md](LINUX.md) for setup instructions and an honest list of what is and
+> isn't confirmed working. Everything below this note describes the original Windows
+> mod.
+
 ### Requirements
 
 * It supports all OpenXR headsets, as long as the VR controllers have enough buttons.
 
-* A gaming PC with a CPU that is good at single-threaded workloads (a recent Intel i5 or Ryzen 5 are recommended at least)! The GPU matters a bit, but the CPU is the bottleneck here.
+* A gaming PC with a strong single-threaded CPU (recent Intel i5 or Ryzen 5 minimum). GPU matters less here.
 
-* A legal copy of BotW for the Wii U.
+* A "legal" copy of BotW for the Wii U.
 
-* Windows OS. [It doesn't work under Linux (even with Wine/Proton) for now](https://github.com/Crementif/BotW-BetterVR/issues/18).
+* Windows OS. [It doesn't work under Linux (even with Wine/Proton) for now](https://github.com/Crementif/BotW-BetterVR/issues/18) - that's true of the official mod; see [LINUX.md](LINUX.md) for this fork's unofficial, unsupported Linux port instead.
 
 * A properly set up [Cemu](http://cemu.info/) emulator that's able to run at 60FPS or higher. See [this guide](https://cemu.cfw.guide/) for more info.
   * **Before reporting issues, make sure that you have a WORKING version of the game that can go in-game on your PC before you install this mod!**  
@@ -31,7 +39,7 @@ It currently supports the following features:
 - There's a small chance that the screen stays black after exiting any menus, which requires restarting the game to continue.
 - Climbing ladders require jumping up the ladder to go up and you have to look at the ladder.
 - You can get stuck behind ladders sometimes, especially when you stop moving at the very top of the ladder while climbing down. So keep moving at the start!
-- It'll lack some comfort options for now, like a left-handed mode ~~or snap turning~~ (added).
+- It'll lack some comfort options for now, like a left-handed mode.
 
 ### Mod Installation
 

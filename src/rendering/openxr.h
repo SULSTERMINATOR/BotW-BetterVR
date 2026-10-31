@@ -3,6 +3,14 @@
 #include "hooking/rumble.h"
 #include "utils/controller_bindings.h"
 
+// Forward declaration needed explicitly here: GCC (unlike MSVC) won't accept the
+// `friend class RND_Renderer;` below alone as sufficient to use RND_Renderer as an
+// incomplete type in the std::unique_ptr<RND_Renderer> member further down - this
+// header is now reached via vulkan2.h before renderer.h ever gets included (same
+// include order the original D3D12 version had via d3d12.h, so this always could
+// have been an issue, just one GCC's stricter parsing surfaces and MSVC didn't).
+class RND_Renderer;
+
 class OpenXR {
     friend class RND_Renderer;
 
@@ -16,8 +24,14 @@ public:
     };
 
     struct Capabilities {
-        LUID adapter;
-        D3D_FEATURE_LEVEL minFeatureLevel;
+        // No LUID/adapter field here anymore: the Windows version used a D3D12 LUID
+        // to match Cemu's hooked Vulkan device to the "VR GPU" OpenXR wants. The
+        // portable replacement is comparing VkPhysicalDeviceIDProperties::deviceUUID
+        // between Cemu's own enumerated devices and Device B's (RND_Vulkan2's) already
+        //-selected physical device - see layer.cpp's EnumeratePhysicalDevices override.
+        // (xrGetVulkanGraphicsDevice2KHR itself can't be called with Cemu's own instance
+        // directly - it requires an instance created via xrCreateVulkanInstanceKHR,
+        // which only Device B's is.)
         bool supportsOrientational;
         bool supportsPositional;
         bool supportsMutatableFOV;
@@ -185,7 +199,9 @@ public:
     } rumbleParameters ;
     std::atomic<RumbleParameters> m_rumbleParameters{};
 
-    void CreateSession(const XrGraphicsBindingD3D12KHR& d3d12Binding);
+    void CreateSession(const XrGraphicsBindingVulkan2KHR& vkBinding);
+    XrInstance GetXrInstance() const { return m_instance; }
+    XrSystemId GetSystemId() const { return m_systemId; }
     void CreateActions();
     std::array<XrViewConfigurationView, 2> GetViewConfigurations();
     std::optional<XrSpaceLocation> UpdateSpaces(XrTime predictedDisplayTime);
@@ -274,9 +290,7 @@ private:
 
     XrDebugUtilsMessengerEXT m_debugMessengerHandle = XR_NULL_HANDLE;
 
-    PFN_xrGetD3D12GraphicsRequirementsKHR func_xrGetD3D12GraphicsRequirementsKHR = nullptr;
-    PFN_xrConvertTimeToWin32PerformanceCounterKHR func_xrConvertTimeToWin32PerformanceCounterKHR = nullptr;
-    PFN_xrConvertWin32PerformanceCounterToTimeKHR func_xrConvertWin32PerformanceCounterToTimeKHR = nullptr;
+    PFN_xrGetVulkanGraphicsRequirements2KHR func_xrGetVulkanGraphicsRequirements2KHR = nullptr;
     PFN_xrCreateDebugUtilsMessengerEXT func_xrCreateDebugUtilsMessengerEXT = nullptr;
     PFN_xrDestroyDebugUtilsMessengerEXT func_xrDestroyDebugUtilsMessengerEXT = nullptr;
 };

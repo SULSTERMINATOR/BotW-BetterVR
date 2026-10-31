@@ -11,7 +11,6 @@ target_include_directories(BetterVR_Layer AFTER PRIVATE ${CMAKE_SOURCE_DIR}/incl
 target_sources(BetterVR_Layer PUBLIC
     ${CMAKE_SOURCE_DIR}/src/instance.h
     ${CMAKE_SOURCE_DIR}/src/shader.h
-    ${CMAKE_SOURCE_DIR}/src/utils/d3d12_utils.h
     ${CMAKE_SOURCE_DIR}/src/utils/vulkan_utils.h
     ${CMAKE_SOURCE_DIR}/src/utils/game_utils.h
     ${CMAKE_SOURCE_DIR}/src/utils/logger.cpp
@@ -44,8 +43,8 @@ target_sources(BetterVR_Layer PUBLIC
     ${CMAKE_SOURCE_DIR}/src/hooking/openxr_motion_bridge.h
     ${CMAKE_SOURCE_DIR}/src/hooking/entity_controller.cpp
     ${CMAKE_SOURCE_DIR}/src/hooking/bow.cpp
-    ${CMAKE_SOURCE_DIR}/src/rendering/d3d12.cpp
-    ${CMAKE_SOURCE_DIR}/src/rendering/d3d12.h
+    ${CMAKE_SOURCE_DIR}/src/rendering/vulkan2.cpp
+    ${CMAKE_SOURCE_DIR}/src/rendering/vulkan2.h
     ${CMAKE_SOURCE_DIR}/src/rendering/renderer.cpp
     ${CMAKE_SOURCE_DIR}/src/rendering/renderer.h
     ${CMAKE_SOURCE_DIR}/src/rendering/openxr.cpp

@@ -2,7 +2,7 @@
 
 #pragma pack(push, 1)
 namespace sead {
-    struct SafeString : BETypeCompatible {
+    struct SafeString : BEAggregateCompatible {
         BEType<uint32_t> c_str;
         BEType<uint32_t> vtable;
     };
@@ -42,7 +42,7 @@ namespace sead {
         BEType<uint32_t> data;
     };
 
-    struct Buffer : BETypeCompatible {
+    struct Buffer : BEAggregateCompatible {
         BEType<int32_t> size;
         BEType<uint32_t> data;
     };
@@ -76,7 +76,7 @@ struct BaseProc {
 };
 static_assert(sizeof(BaseProc) == 0xEC, "BaseProc size mismatch");
 
-enum ActorFlags : int32_t {
+enum ActorFlags : uint32_t {
     ActorFlags_1 = 0x1,
     ActorFlags_PhysicsPauseDisable = 0x2,
     ActorFlags_SetPhysicsMtx = 0x4,
@@ -101,7 +101,7 @@ enum ActorFlags : int32_t {
     ActorFlags_PrepareForDeleteMaybe = 0x80000000,
 };
 
-enum ActorFlags2 : int32_t {
+enum ActorFlags2 : uint32_t {
     ActorFlags2_1 = 0x1,
     ActorFlags2_2 = 0x2,
     ActorFlags2_4 = 0x4,
@@ -136,7 +136,7 @@ enum ActorFlags2 : int32_t {
     ActorFlags2_80000000 = 0x80000000,
 };
 
-enum ActorFlags3 : int32_t {
+enum ActorFlags3 : uint32_t {
     ActorFlags3_DisableHideNonDemoMember = 0x1,
     ActorFlags3_2 = 0x2,
     ActorFlags3_4 = 0x4,
@@ -241,7 +241,7 @@ struct ASListDefinitionPartial {
 static_assert(offsetof(ASListDefinitionPartial, name) == 0x04, "ASListDefinitionPartial.name offset mismatch");
 
 // definitionPtr is only meaningful while assignedCount is set
-struct ASListSlot : BETypeCompatible {
+struct ASListSlot : BEAggregateCompatible {
     BEType<uint32_t> definitionPtr;
     PADDED_BYTES(0x04, 0x08);
     BEType<uint32_t> assignedCount;

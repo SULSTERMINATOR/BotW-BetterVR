@@ -61,9 +61,9 @@ RND_Renderer::ImGuiOverlay::ImGuiOverlay(VkCommandBuffer cb, VkExtent2D fbRes, V
     ImGui::CreateContext();
     ImGui::GetPlatformIO().Platform_OpenInShellFn = &OpenLinkInShell;
     Log::print<INFO>("Installed the ImGui link handler, links in the mod menu can open a browser");
-    ImGui::GetIO().IniFilename = "BetterVR_settings.ini";
+    ImGui::GetIO().IniFilename = GetSettingsIniPath();
     InitSettings();
-    ImGui::LoadIniSettingsFromDisk("BetterVR_settings.ini");
+    ImGui::LoadIniSettingsFromDisk(GetSettingsIniPath());
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 
     ImFontConfig fontCfg{};
@@ -381,6 +381,7 @@ void RND_Renderer::ImGuiOverlay::Update() {
     ImGui::GetIO().FontGlobalScale = 1.0f;
     auto& io = ImGui::GetIO();
 
+#ifdef _WIN32
     POINT p;
     GetCursorPos(&p);
     ScreenToClient(CemuHooks::m_cemuRenderWindow, &p);
@@ -389,6 +390,18 @@ void RND_Renderer::ImGuiOverlay::Update() {
     GetClientRect(CemuHooks::m_cemuRenderWindow, &rect);
     uint32_t windowWidth = rect.right - rect.left;
     uint32_t windowHeight = rect.bottom - rect.top;
+#else
+    // TODO(linux-port): desktop-mouse-driven menu interaction on the flat/mirror
+    // window needs a Wayland/X11-specific mechanism for cursor position, window
+    // geometry, focus state, and button state - none of Win32's GetCursorPos/
+    // ScreenToClient/GetClientRect/GetForegroundWindow/GetAsyncKeyState have a
+    // direct equivalent here. Not required for the actual VR rendering path (the
+    // in-headset menu still works via controller input); this only affects
+    // interacting with the debug menu using the desktop mouse.
+    struct { long x = 0, y = 0; } p;
+    uint32_t windowWidth = m_outputRes.width;
+    uint32_t windowHeight = m_outputRes.height;
+#endif
 
     float fbAspect = (float)m_outputRes.width / (float)m_outputRes.height;
 
@@ -422,6 +435,7 @@ void RND_Renderer::ImGuiOverlay::Update() {
 
     ImVec2 physicalMenuScale = ImVec2(physicalUiRegion.z / logicalRes.x, physicalUiRegion.w / logicalRes.y);
 
+#ifdef _WIN32
     // map desktop cursor input into the centered 16:9 menu region
     p.x = p.x - blackBarWidth - (LONG)physicalUiRegion.x;
     p.y = p.y - blackBarHeight - (LONG)physicalUiRegion.y;
@@ -434,6 +448,14 @@ void RND_Renderer::ImGuiOverlay::Update() {
         io.AddMouseButtonEvent(1, GetAsyncKeyState(VK_RBUTTON) & 0x8000);
         io.AddMouseButtonEvent(2, GetAsyncKeyState(VK_MBUTTON) & 0x8000);
     }
+#else
+    // See the TODO above - desktop mouse input into the menu isn't wired up on
+    // Linux yet, so treat the flat window as never focused for mouse purposes.
+    (void)blackBarWidth;
+    (void)blackBarHeight;
+    (void)physicalMenuScale;
+    bool isWindowFocused = false;
+#endif
 
     bool isWindowFocusedAndMenuOpen = isWindowFocused && VRManager::instance().XR->m_isMenuOpen;
     if (isWindowFocusedAndMenuOpen && GetSettings().IsDebuggingToolsEnabled()) {

@@ -22,6 +22,10 @@ struct std::formatter<VkFormat> : std::formatter<string> {
     }
 };
 
+#ifdef _WIN32
+// Linux: DXGI_FORMAT doesn't exist - this mod's Vulkan-to-D3D12 present pipeline is
+// being replaced with a Vulkan-to-Vulkan one (VkFormat, already covered above), so
+// this formatter simply has no Linux equivalent to provide.
 template <>
 struct std::formatter<DXGI_FORMAT> : std::formatter<string> {
     auto format(const DXGI_FORMAT format, std::format_context& ctx) const {
@@ -54,6 +58,7 @@ struct std::formatter<DXGI_FORMAT> : std::formatter<string> {
         }
     }
 };
+#endif
 
 template <>
 struct std::formatter<glm::fmat3> : std::formatter<string> {
@@ -181,6 +186,7 @@ struct std::formatter<LookAtMatrix> : std::formatter<string> {
 };
 
 
+#ifdef _WIN32
 template <>
 struct std::formatter<D3D_FEATURE_LEVEL> : std::formatter<string> {
     auto format(const D3D_FEATURE_LEVEL featureLevel, std::format_context& ctx) const {
@@ -211,6 +217,7 @@ struct std::formatter<D3D_FEATURE_LEVEL> : std::formatter<string> {
         return std::format_to(ctx.out(), "{:X}", std::to_underlying(featureLevel));
     }
 };
+#endif
 
 static std::string FormatDistance(float distance) {
     float distanceInches = distance * 39.3700787f;
@@ -246,7 +253,7 @@ public:
     Log();
     ~Log();
 
-    template <typename LogType L>
+    template <LogType L>
     static inline bool consteval isLogTypeEnabled() {
         return true;
     }
@@ -267,7 +274,7 @@ public:
     static void SetShowTimestamps(bool enabled);
     static void SetShowThreadIds(bool enabled);
 
-    template <typename LogType L>
+    template <LogType L>
     static inline void print(const char* message) {
         if constexpr (!isLogTypeEnabled<L>()) {
             return;
@@ -284,7 +291,7 @@ public:
         }
     }
 
-    template <typename LogType L, class... Args>
+    template <LogType L, class... Args>
     static inline void print(const char* format, Args&&... args) {
         if constexpr (!isLogTypeEnabled<L>()) {
             return;
@@ -302,7 +309,9 @@ public:
         }
     }
 
+#ifdef _WIN32
     static void printTimeElapsed(const char* message_prefix, LARGE_INTEGER time);
+#endif
     static void Flush();
 
     // ref counted shutdown of the logger
@@ -317,51 +326,67 @@ private:
     inline static constinit std::array<std::atomic_bool, kLogTypeCount> s_categoryEnabled = {};
 };
 
+// Cross-platform fatal-error signaling: log + flush + throw on both platforms.
+// Windows additionally breaks into the debugger (_DEBUG builds) and shows a
+// MessageBoxA; Linux has no equivalent GUI popup here (the mod runs inside
+// Cemu's own process, same as Windows, but there's no portable "show a native
+// dialog from inside a Vulkan layer" primitive worth adding - the thrown
+// exception and logged message are what actually stop execution either way).
+#ifdef _WIN32
+#define BETTERVR_DEBUGBREAK() do { __debugbreak(); } while (0)
+#define BETTERVR_SHOW_FATAL_DIALOG(msg) MessageBoxA(NULL, (msg), "A fatal error occurred!", MB_OK | MB_ICONERROR)
+#else
+#define BETTERVR_DEBUGBREAK() do {} while (0)
+#define BETTERVR_SHOW_FATAL_DIALOG(msg) do {} while (0)
+#endif
+
 static void checkXRResult(const XrResult result, const char* errorMessage) {
     if (XR_FAILED(result)) {
         if (errorMessage == nullptr) {
             Log::print<ERROR>("An unknown error (result was {}) has occurred!", result);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, std::format("An unknown error {} has occurred which caused a fatal crash!", result).c_str(), "An error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(std::format("An unknown error {} has occurred which caused a fatal crash!", result).c_str());
             throw std::runtime_error("Unidentified error occurred!");
         }
         else {
             Log::print<ERROR>("Error {}: {}", result, errorMessage);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, errorMessage, "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(errorMessage);
             throw std::runtime_error(errorMessage);
         }
     }
 }
 
+#ifdef _WIN32
 static void checkHResult(const HRESULT result, const char* errorMessage) {
     if (FAILED(result)) {
         if (errorMessage == nullptr) {
             Log::print<ERROR>("[Error] An unknown error (result was {}) has occurred!", result);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, std::format("An unknown error {} has occurred which caused a fatal crash!", result).c_str(), "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(std::format("An unknown error {} has occurred which caused a fatal crash!", result).c_str());
             throw std::runtime_error("Unidentified error occurred!");
         }
         else {
             Log::print<ERROR>("Error {}: {}", result, errorMessage);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, errorMessage, "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(errorMessage);
             throw std::runtime_error(errorMessage);
         }
     }
 }
+#endif
 
 static void checkVkResult(const VkResult result, const char* errorMessage) {
     if (result != VK_SUCCESS) {
@@ -369,18 +394,18 @@ static void checkVkResult(const VkResult result, const char* errorMessage) {
             Log::print<ERROR>("An unknown error (result was {}) has occurred!", (std::underlying_type_t<VkResult>)result);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, std::format("An unknown error {} has occurred which caused a fatal crash!", (std::underlying_type_t<VkResult>)result).c_str(), "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(std::format("An unknown error {} has occurred which caused a fatal crash!", (std::underlying_type_t<VkResult>)result).c_str());
             throw std::runtime_error("Unidentified error occurred!");
         }
         else {
             Log::print<ERROR>("Error {}: {}", (std::underlying_type_t<VkResult>)result, errorMessage);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, errorMessage, "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(errorMessage);
             throw std::runtime_error(errorMessage);
         }
     }
@@ -392,18 +417,18 @@ static void checkAssert(const bool assert, const char* errorMessage) {
             Log::print<ERROR>("Something unexpected happened that prevents further execution!");
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, "Something unexpected happened that prevents further execution!", "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG("Something unexpected happened that prevents further execution!");
             throw std::runtime_error("Unexpected assertion occurred!");
         }
         else {
             Log::print<ERROR>("{}", errorMessage);
             Log::Flush();
 #ifdef _DEBUG
-            __debugbreak();
+            BETTERVR_DEBUGBREAK();
 #endif
-            MessageBoxA(NULL, errorMessage, "A fatal error occurred!", MB_OK | MB_ICONERROR);
+            BETTERVR_SHOW_FATAL_DIALOG(errorMessage);
             throw std::runtime_error(errorMessage);
         }
     }

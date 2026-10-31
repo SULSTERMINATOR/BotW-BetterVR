@@ -43,6 +43,18 @@ static bool QueuePendingCopyOperation(VkCommandBuffer commandBuffer, SharedTextu
 }
 
 VkResult VkDeviceOverrides::CreateImage(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage) {
+    // Device B creates its own swapchain images (via xrCreateSwapchain -> vkCreateImage on
+    // its own device), which goes through every globally-active layer including this one.
+    // Without this bypass, Device B's own image creation reenters this hook while
+    // framebuffer.cpp's CmdClearColorImage lazy-init is still holding lockImageResolutions
+    // for the entire Layer3D/Layer2D construction that's what triggered Device B's
+    // swapchain creation in the first place - a self-deadlock on that non-recursive mutex.
+    // Confirmed live: the process hung indefinitely, every time, exactly at Device B's
+    // first xrCreateSwapchain call, until this bypass was added.
+    if (IsDeviceBDevice(device)) {
+        return pDispatch.CreateImage(device, pCreateInfo, pAllocator, pImage);
+    }
+
     VkResult res = pDispatch.CreateImage(device, pCreateInfo, pAllocator, pImage);
 
     if (pCreateInfo->extent.width >= 1280 && pCreateInfo->extent.height >= 720) {
@@ -54,6 +66,12 @@ VkResult VkDeviceOverrides::CreateImage(const vkroots::VkDeviceDispatch& pDispat
 }
 
 void VkDeviceOverrides::DestroyImage(const vkroots::VkDeviceDispatch& pDispatch, VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
+    // See the comment in CreateImage above - same bypass, same reasoning.
+    if (IsDeviceBDevice(device)) {
+        pDispatch.DestroyImage(device, image, pAllocator);
+        return;
+    }
+
     lockImageResolutions.lock();
     imageResolutions.erase(image);
     if (s_curr3DColorImage == image) {
@@ -411,6 +429,15 @@ void VkDeviceOverrides::CmdClearDepthStencilImage(const vkroots::VkCommandBuffer
 }
 
 VkResult VkDeviceOverrides::QueueSubmit(const vkroots::VkQueueDispatch& pDispatch, VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
+    // Device B submits its own work (CommandContext, PresentPipeline::Render, the timeline
+    // semaphore signal/wait in texture.cpp) through m_functions.vkQueueSubmit, which -
+    // loaded via vkGetDeviceProcAddr on a globally-layered device - resolves to this same
+    // hook. None of the pending-copy/timeline-semaphore-injection logic below is meaningful
+    // for Device B's own submissions (it's Device A/Cemu-specific), so pass straight through.
+    if (IsDeviceBDevice(pDispatch.pDeviceDispatch->Device)) {
+        return pDispatch.QueueSubmit(queue, submitCount, pSubmits, fence);
+    }
+
     VkResult result = VK_SUCCESS;
 
     size_t pendingCopyCount = 0;

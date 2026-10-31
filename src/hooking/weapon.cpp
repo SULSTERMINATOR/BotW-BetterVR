@@ -447,7 +447,12 @@ void CemuHooks::hook_EnableWeaponAttackSensor(PPCInterpreter_t* hCPU) {
         return;
     }
 
-    auto& currFrame = VRManager::instance().XR->GetRenderer()->GetFrame(frameCounter);
+    auto* renderer = VRManager::instance().XR->GetRenderer();
+    if (renderer == nullptr) {
+        return;
+    }
+
+    auto& currFrame = renderer->GetFrame(frameCounter);
     if (currFrame.ranMotionAnalysis[heldIndex]) {
         Log::print<CONTROLS>("Skipping motion analysis for {}: already ran this frame", heldIndex);
         return;
@@ -455,7 +460,7 @@ void CemuHooks::hook_EnableWeaponAttackSensor(PPCInterpreter_t* hCPU) {
     currFrame.ranMotionAnalysis[heldIndex] = true;
 
     auto inputs = VRManager::instance().XR->m_input.load();
-    auto headset = VRManager::instance().XR->GetRenderer()->GetMiddlePose();
+    auto headset = renderer->GetMiddlePose();
     if (!headset.has_value()) {
         return;
     }

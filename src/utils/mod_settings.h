@@ -1,5 +1,29 @@
 #pragma once
 
+#ifdef __linux__
+#include "linux_layer_dir.h"
+#endif
+
+// Deliberately relative on Windows: Cemu's working directory there is the launcher
+// directory, which is what puts the layer and the launcher's ini in one shared file.
+// On Linux that assumption doesn't hold (an AppImage-launched Cemu can leave the
+// process cwd somewhere useless, e.g. "/" - see build-linux/PORTING_NOTES.md), so this
+// resolves next to the layer's own .so on disk instead of trusting cwd.
+// BETTERVR_SETTINGS_PATH still works as a manual override if you ever need one.
+inline const char* GetSettingsIniPath() {
+    static const std::string path = [] {
+        if (const char* overridePath = std::getenv("BETTERVR_SETTINGS_PATH"); overridePath != nullptr && overridePath[0] != '\0') {
+            return std::string(overridePath);
+        }
+#ifdef __linux__
+        return GetBetterVRLayerDir() + "/BetterVR_settings.ini";
+#else
+        return std::string("BetterVR_settings.ini");
+#endif
+    }();
+    return path.c_str();
+}
+
 class ModSettingBase;
 
 inline std::vector<ModSettingBase*>& SettingRegistry() {
@@ -556,6 +580,8 @@ struct ModSettings {
     BoolSetting uiFollowsGaze{ "UiFollowsGaze", true };
     FloatSetting hudDistance{ "HudDistance", 1.85f, 0.5f, 2.5f };
     FloatSetting hudSize{ "HudSize", 0.85f, 0.4f, 1.75f };
+    BoolSetting hudOnWrist{ "HudOnWrist", false };
+    FloatSetting wristHudSize{ "WristHudSize", 0.12f, 0.04f, 0.4f };
     FloatSetting bowArcOpacity{ "BowArcTransparency", 0.7f, 0.0f, 1.0f };
 
     // advanced settings
@@ -599,6 +625,7 @@ struct ModSettings {
 
     PlayMode GetPlayMode() const { return playMode; }
     bool DoesUIFollowGaze() const { return uiFollowsGaze; }
+    bool IsHudOnWrist() const { return hudOnWrist; }
     bool IsLeftHanded() const { return leftHanded; }
     float GetPlayerHeightOffset() const {
         // disable height offset in third-person mode

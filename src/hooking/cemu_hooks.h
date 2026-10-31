@@ -1,10 +1,35 @@
 #pragma once
 #include "entity_debugger.h"
 #include "utils/mod_settings.h"
+#ifdef __linux__
+#include "utils/linux_symbol_resolver.h"
+#endif
 
 class CemuHooks {
 public:
     CemuHooks() {
+#ifdef __linux__
+        // Linux Cemu builds don't dynamically export these under clean names the way
+        // Windows does - confirmed via direct testing that dlsym() fails even though
+        // the symbols genuinely exist in the (unstripped) binary's regular symbol
+        // table. Resolve them via direct ELF symtab parsing + ASLR load-bias instead.
+        // See utils/linux_symbol_resolver.h for the technique and why it's needed.
+        m_cemuHandle = nullptr;
+
+        void* memBaseVarAddr = LinuxSymbolResolver::instance().Resolve("memory_base");
+        void* titleIdVarAddr = LinuxSymbolResolver::instance().Resolve("_ZN10CafeSystem18sForegroundTitleIdE");
+        void* addFunctionInternalAddr = LinuxSymbolResolver::instance().Resolve("_Z25osLib_addFunctionInternalPKcS0_PFvP16PPCInterpreter_tE");
+        checkAssert(memBaseVarAddr != nullptr && titleIdVarAddr != nullptr && addFunctionInternalAddr != nullptr,
+            "Failed to resolve Cemu internal symbols via ELF symtab! Cemu build may have changed - re-verify symbol names with `nm --defined-only` against the exact Cemu binary in use.");
+
+        s_linux_memoryBaseVarAddr = reinterpret_cast<uint8_t**>(memBaseVarAddr);
+        s_linux_titleIdVarAddr = reinterpret_cast<uint64_t*>(titleIdVarAddr);
+        s_linux_addFunctionInternalFn = reinterpret_cast<Linux_osLib_addFunctionInternal_t>(addFunctionInternalAddr);
+
+        gameMeta_getTitleId = &Linux_gameMeta_getTitleId;
+        memory_getBase = &Linux_memory_getBase;
+        osLib_registerHLEFunction = &Linux_osLib_registerHLEFunction;
+#else
         m_cemuHandle = GetModuleHandleA(NULL);
         checkAssert(m_cemuHandle != NULL, "Failed to get handle of Cemu process which is required for interfacing with Cemu!");
 
@@ -12,6 +37,7 @@ public:
         memory_getBase = (memory_getBasePtr_t)GetProcAddress(m_cemuHandle, "memory_getBase");
         osLib_registerHLEFunction = (osLib_registerHLEFunctionPtr_t)GetProcAddress(m_cemuHandle, "osLib_registerHLEFunction");
         checkAssert(gameMeta_getTitleId != nullptr && memory_getBase != nullptr && osLib_registerHLEFunction != nullptr, "Failed to get function pointers of Cemu functions! Is this hook being used on Cemu?");
+#endif
 
         bool isSupportedTitleId = gameMeta_getTitleId() == 0x00050000101C9300 || gameMeta_getTitleId() == 0x00050000101C9400 || gameMeta_getTitleId() == 0x00050000101C9500;
         checkAssert(isSupportedTitleId, std::format("Expected title IDs for Breath of the Wild (00050000-101C9300, 00050000-101C9400 or 00050000-101C9500) but received {:16x}!", gameMeta_getTitleId()).c_str());
@@ -108,7 +134,9 @@ public:
         osLib_registerHLEFunction("coreinit", "hook_VisualizeRayCastHits", &hook_VisualizeRayCastHits);
     };
     ~CemuHooks() {
+#ifndef __linux__
         FreeLibrary(m_cemuHandle);
+#endif
     };
 
     static HWND m_cemuTopWindow;
@@ -219,7 +247,46 @@ public:
     }
 
 private:
+#ifdef __linux__
+    void* m_cemuHandle;
+
+    // Linux symbol resolution state - see constructor. `memory_base` and
+    // `CafeSystem::sForegroundTitleId` are plain global variables (not functions,
+    // unlike the Windows-exported getters), so these wrappers just dereference the
+    // resolved address to match the existing function-pointer-based interface used
+    // throughout the rest of this class and the codebase.
+    static inline uint8_t** s_linux_memoryBaseVarAddr = nullptr;
+    static inline uint64_t* s_linux_titleIdVarAddr = nullptr;
+    // NOT PPCInterpreter_registerHLECall: that's the low-level primitive Cemu's own
+    // osLib_registerHLEFunction(libraryName, functionName, osFunction) calls internally
+    // (via osLib_addFunctionInternal) - it only appends the callback to a raw index
+    // table, with zero awareness of the library/function name. The actual name -> index
+    // mapping graphic-pack ASM patches resolve through ($import.coreinit.hook_X) is a
+    // SEPARATE table (Cemu's s_osFunctionTable, keyed by a hash of the two name strings)
+    // that only osLib_addFunctionInternal populates. Calling just the low-level primitive
+    // (as an earlier version of this port did) leaves every hook registered-but-unnamed:
+    // it never crashes by itself, but every single graphic-pack patch that references one
+    // of these hooks by name fails to resolve, corrupting whatever depended on getting a
+    // real address back - confirmed live as the root cause of a deterministic native
+    // crash once real 3D gameplay started exercising those patches, and of zero hooks
+    // ever actually firing (verified via direct entry-tracing across a 6-minute session).
+    // osLib_registerHLEFunction itself got inlined away in this release build (it's a
+    // trivial one-line wrapper with nothing else calling it directly), so this resolves
+    // its callee instead - same 3-arg signature, does everything the Windows-exported
+    // wrapper does, just under Itanium name mangling instead of an extern "C" name.
+    typedef void (*Linux_osLib_addFunctionInternal_t)(const char*, const char*, void (*)(PPCInterpreter_t*));
+    static inline Linux_osLib_addFunctionInternal_t s_linux_addFunctionInternalFn = nullptr;
+
+    static uint64_t Linux_gameMeta_getTitleId() { return s_linux_titleIdVarAddr ? *s_linux_titleIdVarAddr : 0; }
+    static void* Linux_memory_getBase() { return s_linux_memoryBaseVarAddr ? (void*)*s_linux_memoryBaseVarAddr : nullptr; }
+    static void Linux_osLib_registerHLEFunction(const char* libraryName, const char* functionName, void (*osFunction)(PPCInterpreter_t* hCPU)) {
+        if (s_linux_addFunctionInternalFn) {
+            s_linux_addFunctionInternalFn(libraryName, functionName, osFunction);
+        }
+    }
+#else
     HMODULE m_cemuHandle;
+#endif
 
     osLib_registerHLEFunctionPtr_t osLib_registerHLEFunction;
     memory_getBasePtr_t memory_getBase;
@@ -346,7 +413,7 @@ public:
     }
 
     template <typename T>
-    static auto getMemory(uint64_t offset) {
+    static std::conditional_t<is_BEType_v<T>, T, BEType<T>> getMemory(uint64_t offset) {
         if constexpr (is_BEType_v<T>) {
             T result;
             readMemory(offset, &result);

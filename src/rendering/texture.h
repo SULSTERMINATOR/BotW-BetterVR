@@ -68,18 +68,27 @@ private:
     VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
 };
 
-class Texture {
+// Represents the SAME underlying frame data as seen from the second, unhooked Vulkan
+// device (Device B) that talks to OpenXR - imported from the hooked device's (Device
+// A's) export via VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT. This replaces what
+// was previously an ID3D12Resource wrapper imported from a Win32 shared handle; the
+// mechanism is otherwise the same idea (Linux has no Win32 handles, so FD-based
+// external memory/semaphore extensions are the equivalent), and this exact FD
+// import/export path was validated standalone (see vk-vk-openxr-test/) against a
+// real Meta Quest 3 through WiVRn before being wired in here.
+class SecondDeviceTexture {
 public:
-    Texture(uint32_t width, uint32_t height, DXGI_FORMAT format);
-    virtual ~Texture();
+    SecondDeviceTexture(uint32_t width, uint32_t height, VkFormat format);
+    virtual ~SecondDeviceTexture();
 
-    void d3d12SignalFence(uint64_t value);
-    void d3d12WaitForFence(uint64_t value);
-    void d3d12TransitionLayout(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
+    void vkSignalSemaphore(uint64_t value);
+    void vkWaitForSemaphore(uint64_t value);
+    void vkTransitionLayout(VkCommandBuffer cmdList, VkImageLayout newLayout);
 
-    ID3D12Resource* d3d12GetTexture() const { return m_d3d12Texture.Get(); }
-    ID3D12Fence* d3d12GetFence() const { return m_d3d12Fence.Get(); }
-    DXGI_FORMAT d3d12GetFormat() const { return m_d3d12Format; }
+    VkImage secondDeviceGetImage() const { return m_secondDeviceImage; }
+    VkImageView secondDeviceGetImageView() const { return m_secondDeviceImageView; }
+    VkSemaphore secondDeviceGetSemaphore() const { return m_secondDeviceSemaphore; }
+    VkFormat secondDeviceGetFormat() const { return m_secondDeviceFormat; }
 
     uint64_t GetLastSignalledValue() const { return m_fenceLastSignaledValue; }
     uint64_t GetLastAwaitedValue() const { return m_fenceLastAwaitedValue; }
@@ -108,20 +117,20 @@ protected:
         m_fenceLastAwaitedValue = value;
     }
 
-    DXGI_FORMAT m_d3d12Format;
-    HANDLE m_d3d12TextureHandle = nullptr;
-    ComPtr<ID3D12Resource> m_d3d12Texture;
-    D3D12_RESOURCE_STATES m_currState = D3D12_RESOURCE_STATE_COMMON;
+    VkFormat m_secondDeviceFormat;
+    VkImage m_secondDeviceImage = VK_NULL_HANDLE;
+    VkImageView m_secondDeviceImageView = VK_NULL_HANDLE;
+    VkDeviceMemory m_secondDeviceMemory = VK_NULL_HANDLE;
+    VkImageLayout m_secondDeviceCurrState = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkSemaphore m_secondDeviceSemaphore = VK_NULL_HANDLE;
 
-    HANDLE m_d3d12FenceHandle = nullptr;
-    ComPtr<ID3D12Fence> m_d3d12Fence;
     uint64_t m_fenceLastSignaledValue = 0;
     uint64_t m_fenceLastAwaitedValue = 0;
 };
 
-class SharedTexture : public Texture, public BaseVulkanTexture {
+class SharedTexture : public SecondDeviceTexture, public BaseVulkanTexture {
 public:
-    SharedTexture(uint32_t width, uint32_t height, VkFormat vkFormat, DXGI_FORMAT d3d12Format);
+    SharedTexture(uint32_t width, uint32_t height, VkFormat vkFormat);
     ~SharedTexture() override;
     void Init(const VkCommandBuffer& cmdBuffer);
 
@@ -129,26 +138,25 @@ public:
     void CopyFromVkImage(VkCommandBuffer cmdBuffer, VkImage srcImage);
     const VkSemaphore& GetSemaphore() const { return m_vkSemaphore; }
 
-    // AMD GPU FIX: Timeline semaphores require strictly increasing values.
-    // Instead of ping-ponging between 0 and 1, we use a monotonically increasing counter.
-    // The flow is:
-    //   1. Vulkan waits for value N (last D3D12 signal, or 0 initially)
-    //   2. Vulkan copies, then signals N+1
-    //   3. D3D12 waits for N+1
-    //   4. D3D12 uses texture, then signals N+2
-    //   5. Next frame: Vulkan waits for N+2, signals N+3, etc.
+    // Timeline semaphores require strictly increasing values. Instead of ping-ponging
+    // between 0 and 1, we use a monotonically increasing counter. The flow is:
+    //   1. Device A (hooked) waits for value N (last Device B signal, or 0 initially)
+    //   2. Device A copies, then signals N+1
+    //   3. Device B waits for N+1
+    //   4. Device B uses texture, then signals N+2
+    //   5. Next frame: Device A waits for N+2, signals N+3, etc.
 
-    // Get the value Vulkan should wait for (the last value D3D12 signaled)
+    // Get the value Device A (hooked Vulkan) should wait for (the last value Device B signaled)
     uint64_t GetVulkanWaitValue() const { return m_fenceCounter.load(); }
 
-    // Get the value Vulkan should signal (increments counter)
+    // Get the value Device A should signal (increments counter)
     uint64_t GetVulkanSignalValue() { return ++m_fenceCounter; }
 
-    // Get the value D3D12 should wait for (the last value Vulkan signaled)
-    uint64_t GetD3D12WaitValue() const { return m_fenceCounter.load(); }
+    // Get the value Device B (second Vulkan device) should wait for (the last value Device A signaled)
+    uint64_t GetSecondDeviceWaitValue() const { return m_fenceCounter.load(); }
 
-    // Get the value D3D12 should signal (increments counter)
-    uint64_t GetD3D12SignalValue() { return ++m_fenceCounter; }
+    // Get the value Device B should signal (increments counter)
+    uint64_t GetSecondDeviceSignalValue() { return ++m_fenceCounter; }
 
     const VkSemaphore& GetSemaphoreForSignal(uint64_t dbg_SignalTo = 0) {
         SetLastSignalledValue(dbg_SignalTo);
@@ -163,4 +171,11 @@ private:
     VkSemaphore m_vkSemaphore = VK_NULL_HANDLE;
     std::atomic_bool m_activeOperation = false;
     std::atomic<uint64_t> m_fenceCounter{0};  // Monotonically increasing fence value
+
+    // Real, live FDs handed from Device A's export to Device B's import. Owned here
+    // only transiently - vkGetMemoryFdKHR/vkGetSemaphoreFdKHR each mint a fresh fd
+    // referencing the same underlying resource, and the subsequent
+    // vkAllocateMemory/vkImportSemaphoreFdKHR call takes ownership of it (Vulkan
+    // closes it internally), matching the exact behavior validated in
+    // vk-vk-openxr-test/main.cpp.
 };

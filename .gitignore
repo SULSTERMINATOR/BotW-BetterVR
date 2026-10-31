@@ -63,3 +63,9 @@ enc_temp_folder/
 BetterVR.zip
 
 compile_commands.json
+
+# Linux build/runtime artifacts (build-linux/*.so already caught by *.so above)
+build-linux/obj/
+build-linux/BetterVR_log.txt
+build-linux/BetterVR_settings.ini
+/BetterVR_settings.ini

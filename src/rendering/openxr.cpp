@@ -3,6 +3,22 @@
 #include "openxr.h"
 #include "instance.h"
 
+#ifndef _WIN32
+// Portable stand-ins for MSVC's C11 Annex K bounds-checked string functions (glibc
+// doesn't implement Annex K at all). Matches the same call shapes used below:
+// a fixed-size destination array, guaranteed null-terminated on return.
+template <size_t N>
+static void strncpy_s(char (&dest)[N], const char* src, size_t maxCount) {
+    size_t copyCount = std::min(maxCount, N - 1);
+    std::strncpy(dest, src, copyCount);
+    dest[copyCount] = '\0';
+}
+template <size_t N>
+static void strcpy_s(char (&dest)[N], const char* src) {
+    strncpy_s(dest, src, N - 1);
+}
+#endif
+
 #ifndef XR_BD_ULTRA_CONTROLLER_INTERACTION_EXTENSION_NAME
 #define XR_BD_ULTRA_CONTROLLER_INTERACTION_EXTENSION_NAME "XR_BD_ultra_controller_interaction"
 #endif
@@ -26,20 +42,16 @@ OpenXR::OpenXR() {
     }
 
     // Create instance with required extensions
-    bool d3d12Supported = false;
+    bool vulkanSupported = false;
     bool depthSupported = false;
-    bool timeConvSupported = false;
     bool debugUtilsSupported = false;
     for (XrExtensionProperties& extensionProperties : instanceExtensions) {
         Log::print<VERBOSE>("Found available OpenXR extension: {}", extensionProperties.extensionName);
-        if (strcmp(extensionProperties.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0) {
-            d3d12Supported = true;
+        if (strcmp(extensionProperties.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
+            vulkanSupported = true;
         }
         if (strcmp(extensionProperties.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0) {
             depthSupported = true;
-        }
-        else if (strcmp(extensionProperties.extensionName, XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME) == 0) {
-            timeConvSupported = true;
         }
         else if (strcmp(extensionProperties.extensionName, XR_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
 #ifdef _DEBUG
@@ -60,23 +72,24 @@ OpenXR::OpenXR() {
         }
     }
 
-    if (!d3d12Supported) {
-        Log::print<ERROR>("OpenXR runtime doesn't support D3D12 (XR_KHR_D3D12_ENABLE)!");
-        throw std::runtime_error("Current OpenXR runtime doesn't support Direct3D 12 (XR_KHR_D3D12_ENABLE). See the Github page's troubleshooting section for a solution!");
+    if (!vulkanSupported) {
+        Log::print<ERROR>("OpenXR runtime doesn't support Vulkan (XR_KHR_vulkan_enable2)!");
+        throw std::runtime_error("Current OpenXR runtime doesn't support Vulkan (XR_KHR_vulkan_enable2). See the Github page's troubleshooting section for a solution!");
     }
     if (!depthSupported) {
-        Log::print<ERROR>("OpenXR runtime doesn't support depth composition layers (XR_KHR_COMPOSITION_LAYER_DEPTH)!");
-        throw std::runtime_error("Current OpenXR runtime doesn't support depth composition layers (XR_KHR_COMPOSITION_LAYER_DEPTH). See the Github page's troubleshooting section for a solution!");
-    }
-    if (!timeConvSupported) {
-        Log::print<WARNING>("OpenXR runtime doesn't support converting time from/to XrTime (XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME). Not required, as of this version.");
+        // Soft requirement on Linux: WiVRn (confirmed via direct hello_xr testing
+        // against this exact runtime) doesn't support XR_KHR_composition_layer_depth
+        // at all. The Windows/D3D12 version hard-required it; here we just don't
+        // submit a depth composition layer at all (see renderer.cpp) rather than
+        // refuse to start - color-only submission works fine without it.
+        Log::print<WARNING>("OpenXR runtime doesn't support depth composition layers (XR_KHR_COMPOSITION_LAYER_DEPTH) - continuing without depth submission.");
     }
     if (!debugUtilsSupported && Log::isLogTypeEnabled<XR_DEBUGUTILS>()) {
         Log::print<INFO>("OpenXR runtime doesn't support debug utils (XR_EXT_DEBUG_UTILS)! Errors/debug information will no longer be able to be shown!");
     }
 
-    std::vector<const char*> enabledExtensions = { XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME };
-    if (timeConvSupported) enabledExtensions.emplace_back(XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
+    std::vector<const char*> enabledExtensions = { XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME };
+    if (depthSupported) enabledExtensions.emplace_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
     if (debugUtilsSupported) enabledExtensions.emplace_back(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (m_capabilities.supportsPicoController) enabledExtensions.emplace_back(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
     if (m_capabilities.supportsPicoUltraController) enabledExtensions.emplace_back(XR_BD_ULTRA_CONTROLLER_INTERACTION_EXTENSION_NAME);
@@ -107,11 +120,7 @@ OpenXR::OpenXR() {
     }
 
     // Load extension pointers for this XrInstance
-    xrGetInstanceProcAddr(m_instance, "xrGetD3D12GraphicsRequirementsKHR", (PFN_xrVoidFunction*)&func_xrGetD3D12GraphicsRequirementsKHR);
-    if (timeConvSupported) {
-        xrGetInstanceProcAddr(m_instance, "xrConvertTimeToWin32PerformanceCounterKHR", (PFN_xrVoidFunction*)&func_xrConvertTimeToWin32PerformanceCounterKHR);
-        xrGetInstanceProcAddr(m_instance, "xrConvertWin32PerformanceCounterToTimeKHR", (PFN_xrVoidFunction*)&func_xrConvertWin32PerformanceCounterToTimeKHR);
-    }
+    xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsRequirements2KHR", (PFN_xrVoidFunction*)&func_xrGetVulkanGraphicsRequirements2KHR);
     if (debugUtilsSupported) {
         xrGetInstanceProcAddr(m_instance, "xrCreateDebugUtilsMessengerEXT", (PFN_xrVoidFunction*)&func_xrCreateDebugUtilsMessengerEXT);
         xrGetInstanceProcAddr(m_instance, "xrDestroyDebugUtilsMessengerEXT", (PFN_xrVoidFunction*)&func_xrDestroyDebugUtilsMessengerEXT);
@@ -143,10 +152,8 @@ OpenXR::OpenXR() {
     checkXRResult(xrGetViewConfigurationProperties(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, &stereoViewConfiguration), "There's no VR headset available that allows stereo rendering!");
     m_capabilities.supportsMutatableFOV = stereoViewConfiguration.fovMutable;
 
-    XrGraphicsRequirementsD3D12KHR graphicsRequirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR };
-    checkXRResult(func_xrGetD3D12GraphicsRequirementsKHR(m_instance, m_systemId, &graphicsRequirements), "Couldn't get D3D12 requirements for the given VR headset!");
-    m_capabilities.adapter = graphicsRequirements.adapterLuid;
-    m_capabilities.minFeatureLevel = graphicsRequirements.minFeatureLevel;
+    XrGraphicsRequirementsVulkan2KHR graphicsRequirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR };
+    checkXRResult(func_xrGetVulkanGraphicsRequirements2KHR(m_instance, m_systemId, &graphicsRequirements), "Couldn't get Vulkan requirements for the given VR headset!");
 
     // Print configuration used, mostly for debugging purposes
     Log::print<INFO>("Acquired system to be used:");
@@ -156,7 +163,7 @@ OpenXR::OpenXR() {
     Log::print<INFO>(" - Supports Mutable FOV: {}", m_capabilities.supportsMutatableFOV ? "Yes" : "No");
     Log::print<INFO>(" - Supports Orientation Tracking: {}", xrSystemProperties.trackingProperties.orientationTracking ? "Yes" : "No");
     Log::print<INFO>(" - Supports Positional Tracking: {}", xrSystemProperties.trackingProperties.positionTracking ? "Yes" : "No");
-    Log::print<INFO>(" - Supports D3D12 feature level {} or higher", graphicsRequirements.minFeatureLevel);
+    Log::print<INFO>(" - Requires Vulkan API {}.{} - {}.{}", XR_VERSION_MAJOR(graphicsRequirements.minApiVersionSupported), XR_VERSION_MINOR(graphicsRequirements.minApiVersionSupported), XR_VERSION_MAJOR(graphicsRequirements.maxApiVersionSupported), XR_VERSION_MINOR(graphicsRequirements.maxApiVersionSupported));
 
     m_capabilities.isOculusLinkRuntime = std::string(properties.runtimeName) == "Oculus";
     Log::print<INFO>(" - Using Meta Quest Link OpenXR runtime: {}", m_capabilities.isOculusLinkRuntime ? "Yes" : "No");
@@ -234,12 +241,12 @@ std::array<XrViewConfigurationView, 2> OpenXR::GetViewConfigurations() {
     return xrViewConf;
 }
 
-void OpenXR::CreateSession(const XrGraphicsBindingD3D12KHR& d3d12Binding) {
+void OpenXR::CreateSession(const XrGraphicsBindingVulkan2KHR& vkBinding) {
     Log::print<INFO>("Creating the OpenXR session...");
 
     XrSessionCreateInfo sessionCreateInfo = { XR_TYPE_SESSION_CREATE_INFO };
     sessionCreateInfo.systemId = m_systemId;
-    sessionCreateInfo.next = &d3d12Binding;
+    sessionCreateInfo.next = &vkBinding;
     sessionCreateInfo.createFlags = 0;
     checkXRResult(xrCreateSession(m_instance, &sessionCreateInfo, &m_session), "Failed to create Vulkan-based OpenXR session!");
 
@@ -816,7 +823,13 @@ void OpenXR::ProcessEvents() {
                 // an exception is thrown here instead of using exit() to allow Cemu to ideally gracefully shutdown
                 //throw std::runtime_error("BetterVR mod has been requested to exit by OpenXR!");
                 //this->m_renderer.reset();
+#ifdef _WIN32
                 PostMessage(CemuHooks::m_cemuTopWindow, WM_CLOSE, 0, 0);
+#else
+                // TODO(linux-port): closing Cemu's window on VR-exit needs a
+                // Wayland/X11-specific mechanism - depends on InitWindowHandles()
+                // (also a known TODO) actually finding the real window first.
+#endif
                 break;
             case XR_SESSION_STATE_LOSS_PENDING:
                 Log::print<VERBOSE>("OpenXR has indicated that the session is going to be lost!");

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "pch.h"
-#include "d3d12.h"
+#include "vulkan2.h"
 #include "openxr.h"
 #include "swapchain.h"
 #include "texture.h"
@@ -232,7 +232,7 @@ public:
         void PrepareRendering(OpenXR::EyeSide side);
         void StartRendering();
         void PrepareDebugDraw(const DebugDrawRenderData& debugDrawData);
-        void RecordRender(RND_D3D12::CommandContext<false>* context, OpenXR::EyeSide side, long frameIdx, const std::array<XrView, 2>& views, SharedTexture* fadeTexture, const DebugDrawRenderData& debugDrawData);
+        void RecordRender(RND_Vulkan2::CommandContext<false>* context, OpenXR::EyeSide side, long frameIdx, const std::array<XrView, 2>& views, SharedTexture* fadeTexture, const DebugDrawRenderData& debugDrawData);
         const std::array<XrCompositionLayerProjectionView, 2>& FinishRendering(const std::array<XrView, 2>& views);
 
         float GetAspectRatio(OpenXR::EyeSide side) const { return m_recommendedAspectRatios[side]; }
@@ -242,14 +242,17 @@ public:
         auto& GetDepthSharedTextures() { return m_depthTextures; }
 
     private:
-        std::array<std::unique_ptr<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>>, 2> m_swapchains;
-        std::array<std::unique_ptr<Swapchain<DXGI_FORMAT_D32_FLOAT>>, 2> m_depthSwapchains;
-        std::array<std::unique_ptr<RND_D3D12::PresentPipeline<true>>, 2> m_presentPipelines;
+        std::array<std::unique_ptr<Swapchain<VK_FORMAT_R8G8B8A8_UNORM>>, 2> m_swapchains;
+        std::array<std::unique_ptr<Swapchain<VK_FORMAT_D32_SFLOAT>>, 2> m_depthSwapchains;
+        std::array<std::unique_ptr<RND_Vulkan2::PresentPipeline>, 2> m_presentPipelines;
         std::array<std::array<std::unique_ptr<SharedTexture>, 2>, 2> m_textures;
         std::array<std::array<std::unique_ptr<SharedTexture>, 2>, 2> m_depthTextures;
         std::array<float, 2> m_recommendedAspectRatios = { 1.0f, 1.0f };
         std::array<RenderUtils::UvTransform, 2> m_presentUvTransforms = {};
-        std::unique_ptr<RND_D3D12::DebugDrawPipeline> m_debugDrawPipeline;
+        // TODO(linux-port): debug-draw overlay pipeline deferred - RND_Vulkan2 has
+        // no equivalent yet. Every call site already null-checks this (see
+        // PrepareDebugDraw/RecordRender in renderer.cpp), so leaving it permanently
+        // null just means the debug overlay never renders; nothing else depends on it.
 
         std::array<XrCompositionLayerProjectionView, 2> m_projectionViews = {};
         std::array<XrCompositionLayerDepthInfoKHR, 2> m_projectionViewsDepthInfo = {};
@@ -271,7 +274,7 @@ public:
         };
         void PrepareRendering() const;
         void StartRendering() const;
-        void RecordRender(RND_D3D12::CommandContext<false>* context, long frameIdx);
+        void RecordRender(RND_Vulkan2::CommandContext<false>* context, long frameIdx);
         std::vector<XrCompositionLayerQuad> FinishRendering(XrTime predictedDisplayTime, long frameIdx);
         long GetCurrentFrameIdx() const { return m_currentFrameIdx; }
         auto& GetSharedTextures() { return m_textures; }
@@ -281,8 +284,8 @@ public:
 
     private:
         static std::atomic_bool s_isBowAimingActive;
-        std::unique_ptr<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>> m_swapchain;
-        std::unique_ptr<RND_D3D12::PresentPipeline<false>> m_presentPipeline;
+        std::unique_ptr<Swapchain<VK_FORMAT_R8G8B8A8_UNORM>> m_swapchain;
+        std::unique_ptr<RND_Vulkan2::PresentPipeline> m_presentPipeline;
         std::array<std::unique_ptr<SharedTexture>, 2> m_textures;
 
         glm::quat m_currentOrientation = glm::identity<glm::fquat>();

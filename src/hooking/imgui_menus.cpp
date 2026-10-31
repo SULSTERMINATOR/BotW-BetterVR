@@ -12,6 +12,13 @@
 #include "weapon.h"
 #include "supporters_generated.h"
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <strings.h>
+#endif
+
 static constexpr ImVec4 kDescriptionColor = ImVec4(0.63f, 0.71f, 0.78f, 1.0f);
 static constexpr ImVec4 kSectionCaptionColor = ImVec4(0.40f, 0.66f, 1.0f, 1.0f);
 static constexpr ImVec4 kHintColor = ImVec4(0.35f, 0.95f, 0.45f, 1.0f);
@@ -208,6 +215,7 @@ static void ApplyPaneNavFallback(ImGuiWindow* sidebarWindow, ImGuiWindow* conten
     }
 }
 
+#ifdef _WIN32
 void ImGuiMenus::OpenLinkInBrowser(const char* url) {
     if (url == nullptr || (_strnicmp(url, "https://", 8) != 0 && _strnicmp(url, "http://", 7) != 0)) {
         Log::print<WARNING>("Refusing to open link that isn't a http(s) URL: {}", url != nullptr ? url : "(null)");
@@ -229,6 +237,45 @@ void ImGuiMenus::OpenLinkInBrowser(const char* url) {
         }
     }).detach();
 }
+#else
+void ImGuiMenus::OpenLinkInBrowser(const char* url) {
+    if (url == nullptr || (strncasecmp(url, "https://", 8) != 0 && strncasecmp(url, "http://", 7) != 0)) {
+        Log::print<WARNING>("Refusing to open link that isn't a http(s) URL: {}", url != nullptr ? url : "(null)");
+        return;
+    }
+
+    // opening the browser can block for a while, so keep it off the render thread. fork+exec
+    // (not system()/popen()) so the URL is never passed through a shell.
+    std::thread([link = std::string(url)]() {
+        pid_t pid = fork();
+        if (pid < 0) {
+            Log::print<WARNING>("Failed to open {} in the default browser (fork failed)", link);
+            return;
+        }
+        if (pid == 0) {
+            // child: replace stdout/stderr with /dev/null so xdg-open's chatter doesn't
+            // land in Cemu's own console/log, then hand off to it.
+            int devNull = open("/dev/null", O_WRONLY);
+            if (devNull != -1) {
+                dup2(devNull, STDOUT_FILENO);
+                dup2(devNull, STDERR_FILENO);
+                close(devNull);
+            }
+            execlp("xdg-open", "xdg-open", link.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            Log::print<INFO>("Opened {} in the default browser, it's behind the game window", link);
+        }
+        else {
+            Log::print<WARNING>("Failed to open {} in the default browser (xdg-open exit status {})", link, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
+    }).detach();
+}
+#endif
 
 static void DrawLink(const char* label, const char* url) {
     if (ImGui::TextLink(label)) {
@@ -1135,6 +1182,18 @@ void RND_Renderer::ImGuiOverlay::DrawInterfacePage(bool* changed) {
         DrawSetting("UI Follows Where You Look", "When off, the HUD stays in one place instead of following your head.", [&]() {
             settings.uiFollowsGaze.AddToGUI(changed);
         });
+        DrawSetting("HUD On Wrist", "Move the HUD onto your left wrist instead of floating in view - check it by looking at your hand.", [&]() {
+            settings.hudOnWrist.AddToGUI(changed);
+        });
+        if (settings.hudOnWrist) {
+            DrawSetting("Wrist HUD Size", [&]() {
+                float size = settings.wristHudSize;
+                if (ImGui::SliderFloat("##wristHudSize", &size, settings.wristHudSize.min, settings.wristHudSize.max, "%.2fx size")) {
+                    settings.wristHudSize = std::clamp(size, settings.wristHudSize.min, settings.wristHudSize.max);
+                    *changed = true;
+                }
+            });
+        }
         DrawSetting("Menu/HUD Distance & Size", [&]() {
             float distance = settings.hudDistance;
             if (ImGui::SliderFloat("##hudDistance", &distance, settings.hudDistance.min, settings.hudDistance.max, FormatDistance(distance).c_str())) {
@@ -1367,7 +1426,7 @@ static void DrawTutorialPromptAndControllerVerification(bool isMenuOpen) {
     if (!settings.tutorialPromptShown) {
         if (isMenuOpen || ImGui::GetTime() > timeLimit) {
             settings.tutorialPromptShown = true;
-            ImGui::SaveIniSettingsToDisk("BetterVR_settings.ini");
+            ImGui::SaveIniSettingsToDisk(GetSettingsIniPath());
         }
     }
 
@@ -1523,7 +1582,7 @@ void RND_Renderer::ImGuiOverlay::DrawHelpMenu() {
 
         if (changed) {
             shouldLogSavedSettingsOnClose = true;
-            ImGui::SaveIniSettingsToDisk("BetterVR_settings.ini");
+            ImGui::SaveIniSettingsToDisk(GetSettingsIniPath());
         }
 
         ImGui::Separator();

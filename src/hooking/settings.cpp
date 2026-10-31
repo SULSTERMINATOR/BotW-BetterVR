@@ -110,6 +110,7 @@ std::atomic_uint32_t CemuHooks::s_recordingOutputMode = 0;
 
 std::unordered_set<ScreenId> prevEnabledScreens = {};
 
+#ifdef _WIN32
 void CemuHooks::InitWindowHandles() {
     // find HWND that starts with Cemu in its title
     struct EnumWindowsData {
@@ -146,6 +147,13 @@ void CemuHooks::InitWindowHandles() {
     }
     m_cemuRenderWindow = iteratedHwnd;
 }
+#else
+void CemuHooks::InitWindowHandles() {
+    // Linux: real Wayland/X11 window discovery isn't implemented yet (see the HWND
+    // placeholder note in pch.h). m_cemuTopWindow/m_cemuRenderWindow just stay NULL,
+    // which the rest of the mod already treats as "no window found".
+}
+#endif
 
 void CemuHooks::hook_UpdateSettings(PPCInterpreter_t* hCPU) {
     // Log::print("Updated settings!");

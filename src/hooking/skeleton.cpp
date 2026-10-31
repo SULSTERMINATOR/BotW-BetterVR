@@ -5,6 +5,8 @@
 #include "rendering/openxr.h"
 #include "utils/debug_draw.h"
 
+#include <map>
+
 struct Bone {
     std::string name;
     glm::vec3 localPos;
@@ -156,7 +158,7 @@ public:
         glm::vec3 ortho = glm::normalize(glm::cross(planeNormal, dirNorm));
 
         // arm 1 direction (world)
-        glm::vec3 arm1Dir = glm::normalize(dirNorm * cos(alpha) + ortho * sin(alpha));
+        glm::vec3 arm1Dir = glm::normalize(dirNorm * glm::cos(alpha) + ortho * glm::sin(alpha));
 
         // arm 2 direction (world)
         glm::vec3 elbowPos = rootPos + arm1Dir * l1;
@@ -791,7 +793,8 @@ void CemuHooks::hook_ModifyBoneMatrix(PPCInterpreter_t* hCPU) {
 
     // override the root transform so the body aligns with the headset yaw
     if (boneName == "Skl_Root") {
-        auto headsetPose = VRManager::instance().XR->GetRenderer()->GetMiddlePose();
+        auto* renderer = VRManager::instance().XR->GetRenderer();
+        auto headsetPose = renderer != nullptr ? renderer->GetMiddlePose() : std::nullopt;
         glm::mat4 headsetMtx = headsetPose.value_or(ToMat4(glm::fvec3(0)));
 
         // calculate eye offset from eyeball bones (once)

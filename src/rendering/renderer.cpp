@@ -5,7 +5,6 @@
 #include "texture.h"
 #include "hooking/bow.h"
 #include "hooking/cemu_hooks.h"
-#include "utils/d3d12_utils.h"
 #include "utils/render_utils.h"
 #include "hooking/imgui_menus.h"
 
@@ -195,7 +194,7 @@ void RND_Renderer::StartFrame() {
     XrFrameBeginInfo beginFrameInfo = { XR_TYPE_FRAME_BEGIN_INFO };
     checkXRResult(xrBeginFrame(m_session, &beginFrameInfo), "Couldn't begin OpenXR frame!");
 
-    VRManager::instance().D3D12->StartFrame();
+    VRManager::instance().VK2->StartFrame();
     const std::optional<XrSpaceLocation> headLocation = VRManager::instance().XR->UpdateSpaces(m_frameState.predictedDisplayTime);
     VRManager::instance().XR->UpdateSeatedHeightCalibration(m_frameState.predictedDisplayTime, headLocation);
     m_frameViewsPending = true;
@@ -338,8 +337,7 @@ void RND_Renderer::EndFrame() {
             }
 
             SharedTexture* fadeTexture = shouldRender2D ? m_layer2D->GetSharedTextures()[hudFrameIdx].get() : nullptr;
-            RND_D3D12::CommandContext<false> renderFrame(VRManager::instance().D3D12.get(), [this, shouldRender2D, shouldRender3D, hudFrameIdx, presented3DFrameIdx, presented3DViews, fadeTexture, &debugDrawData](RND_D3D12::CommandContext<false>* context) {
-                D3D12_SET_NAME(context->GetRecordList(), L"RenderXRFrame");
+            RND_Vulkan2::CommandContext<false> renderFrame(VRManager::instance().VK2.get(), [this, shouldRender2D, shouldRender3D, hudFrameIdx, presented3DFrameIdx, presented3DViews, fadeTexture, &debugDrawData](RND_Vulkan2::CommandContext<false>* context) {
 
                 if (shouldRender2D) {
                     m_layer2D->RecordRender(context, hudFrameIdx);
@@ -422,7 +420,7 @@ void RND_Renderer::EndFrame() {
         Log::print<ERROR>("xrEndFrame #{} FAILED with result {}", s_endFrameCount, (int)xrResult);
     }
 
-    VRManager::instance().D3D12->EndFrame();
+    VRManager::instance().VK2->EndFrame();
     m_xrFrameActive = false;
 }
 
@@ -566,29 +564,24 @@ RND_Renderer::Layer3D::Layer3D(VkExtent2D inputRes, VkExtent2D outputRes) {
         m_presentUvTransforms[side] = RenderUtils::GetPresentationUvTransform(rawFov, inputAspectRatio);
     }
 
-    this->m_presentPipelines[OpenXR::EyeSide::LEFT] = std::make_unique<RND_D3D12::PresentPipeline<true>>(VRManager::instance().XR->GetRenderer());
-    this->m_presentPipelines[OpenXR::EyeSide::RIGHT] = std::make_unique<RND_D3D12::PresentPipeline<true>>(VRManager::instance().XR->GetRenderer());
-    this->m_debugDrawPipeline = std::make_unique<RND_D3D12::DebugDrawPipeline>();
+    this->m_presentPipelines[OpenXR::EyeSide::LEFT] = std::make_unique<RND_Vulkan2::PresentPipeline>(VRManager::instance().XR->GetRenderer());
+    this->m_presentPipelines[OpenXR::EyeSide::RIGHT] = std::make_unique<RND_Vulkan2::PresentPipeline>(VRManager::instance().XR->GetRenderer());
+    // m_debugDrawPipeline intentionally left null - see the TODO on its declaration in renderer.h
 
-    this->m_swapchains[OpenXR::EyeSide::LEFT] = std::make_unique<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>>(outputRes.width, outputRes.height, viewConfs[0].recommendedSwapchainSampleCount);
-    this->m_swapchains[OpenXR::EyeSide::RIGHT] = std::make_unique<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>>(outputRes.width, outputRes.height, viewConfs[1].recommendedSwapchainSampleCount);
-    this->m_depthSwapchains[OpenXR::EyeSide::LEFT] = std::make_unique<Swapchain<DXGI_FORMAT_D32_FLOAT>>(outputRes.width, outputRes.height, viewConfs[0].recommendedSwapchainSampleCount);
-    this->m_depthSwapchains[OpenXR::EyeSide::RIGHT] = std::make_unique<Swapchain<DXGI_FORMAT_D32_FLOAT>>(outputRes.width, outputRes.height, viewConfs[1].recommendedSwapchainSampleCount);
+    this->m_swapchains[OpenXR::EyeSide::LEFT] = std::make_unique<Swapchain<VK_FORMAT_R8G8B8A8_UNORM>>(outputRes.width, outputRes.height, viewConfs[0].recommendedSwapchainSampleCount);
+    this->m_swapchains[OpenXR::EyeSide::RIGHT] = std::make_unique<Swapchain<VK_FORMAT_R8G8B8A8_UNORM>>(outputRes.width, outputRes.height, viewConfs[1].recommendedSwapchainSampleCount);
+    this->m_depthSwapchains[OpenXR::EyeSide::LEFT] = std::make_unique<Swapchain<VK_FORMAT_D32_SFLOAT>>(outputRes.width, outputRes.height, viewConfs[0].recommendedSwapchainSampleCount);
+    this->m_depthSwapchains[OpenXR::EyeSide::RIGHT] = std::make_unique<Swapchain<VK_FORMAT_D32_SFLOAT>>(outputRes.width, outputRes.height, viewConfs[1].recommendedSwapchainSampleCount);
 
     this->m_presentPipelines[OpenXR::EyeSide::LEFT]->BindSettings((float)outputRes.width, (float)outputRes.height, m_presentUvTransforms[OpenXR::EyeSide::LEFT]);
     this->m_presentPipelines[OpenXR::EyeSide::RIGHT]->BindSettings((float)outputRes.width, (float)outputRes.height, m_presentUvTransforms[OpenXR::EyeSide::RIGHT]);
 
     // initialize textures
     for (int i = 0; i < 2; ++i) {
-        this->m_textures[OpenXR::EyeSide::LEFT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_A2B10G10R10_UNORM_PACK32, D3D12Utils::ToDXGIFormat(VK_FORMAT_A2B10G10R10_UNORM_PACK32));
-        this->m_textures[OpenXR::EyeSide::RIGHT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_A2B10G10R10_UNORM_PACK32, D3D12Utils::ToDXGIFormat(VK_FORMAT_A2B10G10R10_UNORM_PACK32));
-        this->m_depthTextures[OpenXR::EyeSide::LEFT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_D32_SFLOAT, D3D12Utils::ToDXGIFormat(VK_FORMAT_D32_SFLOAT));
-        this->m_depthTextures[OpenXR::EyeSide::RIGHT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_D32_SFLOAT, D3D12Utils::ToDXGIFormat(VK_FORMAT_D32_SFLOAT));
-
-        D3D12_SET_NAME(this->m_textures[OpenXR::EyeSide::LEFT][i]->d3d12GetTexture(), L"Layer3D - Left Color Texture");
-        D3D12_SET_NAME(this->m_textures[OpenXR::EyeSide::RIGHT][i]->d3d12GetTexture(), L"Layer3D - Right Color Texture");
-        D3D12_SET_NAME(this->m_depthTextures[OpenXR::EyeSide::LEFT][i]->d3d12GetTexture(), L"Layer3D - Left Depth Texture");
-        D3D12_SET_NAME(this->m_depthTextures[OpenXR::EyeSide::RIGHT][i]->d3d12GetTexture(), L"Layer3D - Right Depth Texture");
+        this->m_textures[OpenXR::EyeSide::LEFT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+        this->m_textures[OpenXR::EyeSide::RIGHT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+        this->m_depthTextures[OpenXR::EyeSide::LEFT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_D32_SFLOAT);
+        this->m_depthTextures[OpenXR::EyeSide::RIGHT][i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_D32_SFLOAT);
     }
 }
 
@@ -662,20 +655,23 @@ void RND_Renderer::Layer3D::StartRendering() {
 }
 
 void RND_Renderer::Layer3D::PrepareDebugDraw(const DebugDrawRenderData& debugDrawData) {
-    if (m_debugDrawPipeline == nullptr || debugDrawData.IsEmpty()) {
-        return;
-    }
-
-    m_debugDrawPipeline->UploadRenderData(debugDrawData);
+    // Debug-draw overlay deferred - see the TODO on m_debugDrawPipeline in renderer.h
+    return;
 }
 
-void RND_Renderer::Layer3D::RecordRender(RND_D3D12::CommandContext<false>* context, OpenXR::EyeSide side, long frameIdx, const std::array<XrView, 2>& views, SharedTexture* fadeTexture, const DebugDrawRenderData& debugDrawData) {
+void RND_Renderer::Layer3D::RecordRender(RND_Vulkan2::CommandContext<false>* context, OpenXR::EyeSide side, long frameIdx, const std::array<XrView, 2>& views, SharedTexture* fadeTexture, const DebugDrawRenderData& debugDrawData) {
     BetterVRProfiler::Scope profile(BetterVRProfiler::Section::Layer3DRender);
 
     checkAssert(context != nullptr, "Layer3D render context is missing!");
 
     auto& texture = m_textures[side][frameIdx];
-    auto& depthTexture = m_depthTextures[side][frameIdx];
+    // Note: depthTexture is intentionally not waited/signaled/bound here - the
+    // simplified Linux present pipeline doesn't submit a depth composition layer
+    // (WiVRn doesn't support XR_KHR_composition_layer_depth), so nothing on Device B
+    // ever needs to read it. It still gets copied into by Device A every frame
+    // (framebuffer.cpp's capture logic doesn't know or care whether Device B
+    // consumes it), which is harmless for a timeline semaphore - Device A's signals
+    // just accumulate without anything waiting on them.
     checkAssert(fadeTexture != nullptr, "Layer3D fade texture is missing!");
 
     m_presentPipelines[side]->SetUvTransform(RenderUtils::GetPresentationUvTransform(
@@ -683,35 +679,27 @@ void RND_Renderer::Layer3D::RecordRender(RND_D3D12::CommandContext<false>* conte
         VRManager::instance().XR->GetRenderer()->m_gameRenderAspectRatio
     ));
 
-    context->WaitFor(texture.get(), texture->GetD3D12WaitValue());
-    context->WaitFor(depthTexture.get(), depthTexture->GetD3D12WaitValue());
+    context->WaitFor(texture.get(), texture->GetSecondDeviceWaitValue());
 
-    // swapchains are already in D3D12_RESOURCE_STATE_RENDER_TARGET and depth in D3D12_RESOURCE_STATE_DEPTH_WRITE according to OpenXR spec
-    m_presentPipelines[side]->BindAttachment(0, texture->d3d12GetTexture());
-    m_presentPipelines[side]->BindAttachment(1, depthTexture->d3d12GetTexture(), DXGI_FORMAT_R32_FLOAT);
-    m_presentPipelines[side]->BindAttachment(2, fadeTexture->d3d12GetTexture());
-    m_presentPipelines[side]->BindTarget(0, m_swapchains[side]->GetTexture(), m_swapchains[side]->GetFormat());
-    m_presentPipelines[side]->BindDepthTarget(m_depthSwapchains[side]->GetTexture(), m_depthSwapchains[side]->GetFormat());
-    m_presentPipelines[side]->Render(context->GetRecordList(), m_swapchains[side]->GetTexture());
+    m_presentPipelines[side]->BindAttachment(0, texture->secondDeviceGetImageView());
+    m_presentPipelines[side]->BindFadeSample(fadeTexture->secondDeviceGetImageView());
 
-    if (m_debugDrawPipeline != nullptr && debugDrawData.hasViewProjections[side]) {
-        m_debugDrawPipeline->Render(
-            side,
-            context->GetRecordList(),
-            depthTexture->d3d12GetTexture(),
-            m_swapchains[side]->GetTexture(),
-            m_swapchains[side]->GetFormat(),
-            m_depthSwapchains[side]->GetTexture(),
-            m_depthSwapchains[side]->GetFormat(),
-            debugDrawData,
-            debugDrawData.viewProjections[side]
-        );
-    }
+    VkImage dstImage = m_swapchains[side]->GetTexture();
+    VkImageMemoryBarrier toColorAttachment = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toColorAttachment.image = dstImage;
+    toColorAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    toColorAttachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VRManager::instance().VK2->fn().vkCmdPipelineBarrier(context->GetRecordList(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toColorAttachment);
 
-    // no transition needed here as OpenXR requires the swapchain to be returned in RENDER_TARGET/DEPTH_WRITE too
-    context->Signal(texture.get(), texture->GetD3D12SignalValue());
-    context->Signal(depthTexture.get(), depthTexture->GetD3D12SignalValue());
-    // Log::print("[D3D12 - 3D Layer] Rendering finished");
+    m_presentPipelines[side]->Render(context->GetRecordList(), dstImage, m_swapchains[side]->GetTextureView(), m_swapchains[side]->GetFormat(), m_swapchains[side]->GetWidth(), m_swapchains[side]->GetHeight());
+
+    // debug-draw overlay deferred - see the TODO on m_debugDrawPipeline in renderer.h
+
+    context->Signal(texture.get(), texture->GetSecondDeviceSignalValue());
 }
 
 const std::array<XrCompositionLayerProjectionView, 2>& RND_Renderer::Layer3D::FinishRendering(const std::array<XrView, 2>& views) {
@@ -795,23 +783,21 @@ const std::array<XrCompositionLayerProjectionView, 2>& RND_Renderer::Layer3D::Fi
 RND_Renderer::Layer2D::Layer2D(VkExtent2D inputRes, VkExtent2D outputRes) {
     auto viewConfs = VRManager::instance().XR->GetViewConfigurations();
 
-    this->m_presentPipeline = std::make_unique<RND_D3D12::PresentPipeline<false>>(VRManager::instance().XR->GetRenderer());
+    this->m_presentPipeline = std::make_unique<RND_Vulkan2::PresentPipeline>(VRManager::instance().XR->GetRenderer());
 
-    this->m_swapchain = std::make_unique<Swapchain<DXGI_FORMAT_R8G8B8A8_UNORM_SRGB>>(inputRes.width, inputRes.height, viewConfs[0].recommendedSwapchainSampleCount);
+    this->m_swapchain = std::make_unique<Swapchain<VK_FORMAT_R8G8B8A8_UNORM>>(inputRes.width, inputRes.height, viewConfs[0].recommendedSwapchainSampleCount);
 
     this->m_presentPipeline->BindSettings(outputRes.width, outputRes.height);
 
     // initialize textures
     for (int i = 0; i < 2; ++i) {
-        this->m_textures[i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_A2B10G10R10_UNORM_PACK32, D3D12Utils::ToDXGIFormat(VK_FORMAT_A2B10G10R10_UNORM_PACK32));
-        D3D12_SET_NAME(this->m_textures[i]->d3d12GetTexture(), L"Layer2D - Color Texture");
+        this->m_textures[i] = std::make_unique<SharedTexture>(inputRes.width, inputRes.height, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     }
 
     {
-        RND_D3D12::CommandContext<true> transitionInitialTextures(VRManager::instance().D3D12.get(), [this](RND_D3D12::CommandContext<true>* context) {
-            D3D12_SET_NAME(context->GetRecordList(), L"transitionInitialTextures");
+        RND_Vulkan2::CommandContext<true> transitionInitialTextures(VRManager::instance().VK2.get(), [this](RND_Vulkan2::CommandContext<true>* context) {
             for (int i = 0; i < 2; ++i) {
-                this->m_textures[i]->d3d12TransitionLayout(context->GetRecordList(), D3D12_RESOURCE_STATE_COMMON);
+                this->m_textures[i]->SecondDeviceTexture::vkTransitionLayout(context->GetRecordList(), VK_IMAGE_LAYOUT_GENERAL);
             }
         });
     }
@@ -841,7 +827,7 @@ void RND_Renderer::Layer2D::PrepareRendering() const {
     m_swapchain->PrepareRendering();
 }
 
-void RND_Renderer::Layer2D::RecordRender(RND_D3D12::CommandContext<false>* context, long frameIdx) {
+void RND_Renderer::Layer2D::RecordRender(RND_Vulkan2::CommandContext<false>* context, long frameIdx) {
     BetterVRProfiler::Scope profile(BetterVRProfiler::Section::Layer2DRender);
 
     checkAssert(context != nullptr, "Layer2D render context is missing!");
@@ -849,13 +835,29 @@ void RND_Renderer::Layer2D::RecordRender(RND_D3D12::CommandContext<false>* conte
     // wait for both since we only have one 2D swap buffer to render to
     // fixme: Why do we signal to the global command list instead of the local one?!
     auto& texture = m_textures[frameIdx];
-    context->WaitFor(texture.get(), texture->GetD3D12WaitValue());
+    context->WaitFor(texture.get(), texture->GetSecondDeviceWaitValue());
 
-    m_presentPipeline->BindAttachment(0, texture->d3d12GetTexture());
-    m_presentPipeline->BindTarget(0, m_swapchain->GetTexture(), m_swapchain->GetFormat());
-    m_presentPipeline->Render(context->GetRecordList(), m_swapchain->GetTexture());
+    m_presentPipeline->BindAttachment(0, texture->secondDeviceGetImageView());
+    // This layer IS the fade source Layer3D samples from, so it has no fade source
+    // of its own - self-reference as a harmless placeholder (only matters visually
+    // if IsFadeActive() happens to be true while the HUD itself is also rendering,
+    // a minor cosmetic edge case, not a functional one).
+    m_presentPipeline->BindFadeSample(texture->secondDeviceGetImageView());
 
-    context->Signal(texture.get(), texture->GetD3D12SignalValue());
+    VkImage dstImage = m_swapchain->GetTexture();
+    VkImageMemoryBarrier toColorAttachment = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toColorAttachment.image = dstImage;
+    toColorAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    toColorAttachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VRManager::instance().VK2->fn().vkCmdPipelineBarrier(context->GetRecordList(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toColorAttachment);
+
+    m_presentPipeline->Render(context->GetRecordList(), dstImage, m_swapchain->GetTextureView(), m_swapchain->GetFormat(), m_swapchain->GetWidth(), m_swapchain->GetHeight());
+
+    context->Signal(texture.get(), texture->GetSecondDeviceSignalValue());
 }
 
 static glm::fvec3 GetHorizontalGazeDirection(const glm::quat& headOrientation) {
@@ -888,6 +890,9 @@ std::vector<XrCompositionLayerQuad> RND_Renderer::Layer2D::FinishRendering(XrTim
     auto inputState = VRManager::instance().XR->m_input.load();
     const bool wasBowAimingSet = IsBowAimingActive();
     const bool isBowAiming = wasBowAimingSet && inputState.shared.in_game;
+    // Bow aiming always wins: you need the reticle where you're looking regardless of
+    // the general HUD placement mode.
+    const bool onWrist = GetSettings().IsHudOnWrist() && !isBowAiming;
 
     // the pause menu blanks briefly between tabs, so only unlock after it stays closed
     constexpr uint32_t GAZE_UNLOCK_FRAMES = 5;
@@ -903,7 +908,36 @@ std::vector<XrCompositionLayerQuad> RND_Renderer::Layer2D::FinishRendering(XrTim
         m_gazeUnlockCounter = 0;
     }
 
-    if (GetSettings().DoesUIFollowGaze() || isBowAiming) {
+    constexpr XrSpaceLocationFlags kPoseValidBits = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    const auto& leftPoseLocation = inputState.shared.poseLocation[OpenXR::EyeSide::LEFT];
+    const bool leftPoseValid = inputState.shared.in_game && (leftPoseLocation.locationFlags & kPoseValidBits) == kPoseValidBits;
+    // A gamepad has no spatial pose at all (poseLocation stays invalid), so this only
+    // actually engages with real tracked motion controllers connected - this same flag
+    // must gate the panel's size below too, or a gamepad session gets the tiny
+    // wrist-sized panel with none of the wrist placement to make it readable.
+    const bool wristPlacementActive = onWrist && leftPoseValid;
+
+    if (wristPlacementActive) {
+        // poseLocation is already resolved against m_stageSpace (see openxr.cpp's
+        // xrLocateSpace call), the same space this composition layer uses, so the
+        // controller pose can be used directly with no extra transform.
+        glm::vec3 wristPosition = ToGLM(leftPoseLocation.pose.position);
+        glm::quat wristOrientation = ToGLM(leftPoseLocation.pose.orientation);
+
+        // Local-space offset/tilt so the panel sits just above the back of the wrist,
+        // angled to face the eye when you turn your forearm to look at it. Grip pose
+        // axis conventions vary by controller/runtime, so this is a first guess -
+        // expect to retune once seen live in headset.
+        constexpr glm::vec3 kLocalOffset = { 0.0f, 0.06f, -0.02f };
+        constexpr float kTiltDegrees = 60.0f;
+
+        glm::vec3 targetPosition = wristPosition + (wristOrientation * kLocalOffset);
+        glm::quat targetOrientation = wristOrientation * glm::angleAxis(glm::radians(kTiltDegrees), glm::vec3(1.0f, 0.0f, 0.0f));
+
+        layerPose.position = ToXR(targetPosition);
+        layerPose.orientation = ToXR(targetOrientation);
+    }
+    else if (GetSettings().DoesUIFollowGaze() || isBowAiming) {
         m_currentOrientation = glm::slerp(m_currentOrientation, headOrientation, LERP_SPEED);
         glm::vec3 forwardDirection = m_isGazeLocked ? m_lockedGazeForward : headOrientation * glm::vec3(0.0f, 0.0f, -1.0f);
 
@@ -934,7 +968,7 @@ std::vector<XrCompositionLayerQuad> RND_Renderer::Layer2D::FinishRendering(XrTim
     const float height = aspectRatio <= 1.0f ? 1.0f / aspectRatio : 1.0f;
 
     // todo: change space to head space if we want to follow the head
-    const float LAYER_SIZE = GetSettings().hudSize;
+    const float LAYER_SIZE = wristPlacementActive ? GetSettings().wristHudSize : GetSettings().hudSize;
 
     std::vector<XrCompositionLayerQuad> layers;
 

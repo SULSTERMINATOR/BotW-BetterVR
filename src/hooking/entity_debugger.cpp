@@ -7,6 +7,8 @@
 #include "utils/debug_draw.h"
 #include "utils/game_utils.h"
 
+#include <map>
+
 std::mutex g_actorListMutex;
 std::unordered_map<uint32_t, std::pair<std::string, uint32_t>> s_knownActors;
 glm::fvec3 CemuHooks::s_playerPos = {};
@@ -629,6 +631,7 @@ void EntityDebugger::RemoveEntityValue(uint32_t actorId, const std::string& valu
                                 it->second.values.end());
     }
 }
+#ifdef _WIN32
 std::array<bool, 256> s_pressedKeyState = {};
 std::array<bool, ImGuiKey_NamedKey_COUNT> s_pressedNamedKeyState = {};
 
@@ -721,3 +724,11 @@ void EntityDebugger::UpdateKeyboardControls() {
         ImGui::GetIO().AddKeyEvent(ImGuiKey_Backspace, false);
     }
 }
+#else
+// Linux: desktop keyboard-driven text entry for the entity debugger's ImGui overlay is
+// deferred, same as the desktop-mouse interaction guarded out in vulkan_imgui.cpp - this
+// debug tool isn't required for the core VR rendering path. GetAsyncKeyState-based polling
+// has no portable equivalent worth building for a debug-only feature.
+void EntityDebugger::UpdateKeyboardControls() {
+}
+#endif

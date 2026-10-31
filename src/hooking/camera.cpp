@@ -29,7 +29,9 @@ void CemuHooks::hook_BeginCameraSide(PPCInterpreter_t* hCPU) {
 }
 
 bool CemuHooks::UseMonoFrameBufferTemporarilyDuringMenusOrPictures() {
-    return !IsAnyFadeScreenVisible() && (IsFlatCameraModeActive() || IsScreenOpen(ScreenId::PauseMenuInfo_00) || VRManager::instance().XR->GetRenderer()->IsGameCapturing3DFrameBuffer());
+    auto* renderer = VRManager::instance().XR->GetRenderer();
+    const bool isCapturing3D = renderer != nullptr && renderer->IsGameCapturing3DFrameBuffer();
+    return !IsAnyFadeScreenVisible() && (IsFlatCameraModeActive() || IsScreenOpen(ScreenId::PauseMenuInfo_00) || isCapturing3D);
 }
 
 // Write a frustum into a sead::PerspectiveProjection: the scalars the game reads back, the
@@ -564,7 +566,11 @@ void CemuHooks::hook_UpdateCameraForGameplay(PPCInterpreter_t* hCPU) {
     UpdateDebugEyeViewsFromGameplayPose(s_wsCameraPosition, s_wsCameraRotation);
 
     // current VR headset camera matrix
-    auto viewsOpt = VRManager::instance().XR->GetRenderer()->GetMiddlePose();
+    auto* renderer = VRManager::instance().XR->GetRenderer();
+    if (renderer == nullptr) {
+        return;
+    }
+    auto viewsOpt = renderer->GetMiddlePose();
     if (!viewsOpt) {
         Log::print<ERROR>("hook_UpdateCameraForGameplay: No views available for the middle pose.");
         return;

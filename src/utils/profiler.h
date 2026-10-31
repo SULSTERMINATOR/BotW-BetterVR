@@ -332,8 +332,12 @@ private:
     inline static std::atomic_bool s_enabled = false;
     inline static std::atomic_bool s_hasPpcSamples = false;
     inline static std::atomic_uint32_t s_spanGeneration = 1;
-    inline static std::array<SectionState, kSectionCount> s_states = {};
-    inline static thread_local ThreadSpanState s_threadSpanState = {};
+    // Declared here, defined out-of-line below (after the class is complete) - GCC
+    // (unlike MSVC) requires SectionState/ThreadSpanState's own default member
+    // initializers to be fully resolved before they can be used to default-construct
+    // a static member of the still-incomplete enclosing class.
+    static std::array<SectionState, kSectionCount> s_states;
+    static thread_local ThreadSpanState s_threadSpanState;
     inline static constexpr std::array<const char*, kSectionCount> s_sectionNames = {
         "Roomscale Resolve",
         "Roomscale Begin",
@@ -435,3 +439,6 @@ private:
         }
     }
 };
+
+inline std::array<BetterVRProfiler::SectionState, BetterVRProfiler::kSectionCount> BetterVRProfiler::s_states;
+inline thread_local BetterVRProfiler::ThreadSpanState BetterVRProfiler::s_threadSpanState;
