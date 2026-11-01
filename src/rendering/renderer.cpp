@@ -191,12 +191,35 @@ void RND_Renderer::StartFrame() {
 
     m_frameStartTime = std::chrono::high_resolution_clock::now();
 
+    // BETTERVR_PRESENT_STATS=1: split StartFrame's blocking time, averaged over 5 s
+    static const bool s_startStats = [] { const char* e = getenv("BETTERVR_PRESENT_STATS"); return e && e[0] == '1'; }();
+    const auto st0 = std::chrono::steady_clock::now();
+
     XrFrameBeginInfo beginFrameInfo = { XR_TYPE_FRAME_BEGIN_INFO };
     checkXRResult(xrBeginFrame(m_session, &beginFrameInfo), "Couldn't begin OpenXR frame!");
+    const auto st1 = std::chrono::steady_clock::now();
 
     VRManager::instance().VK2->StartFrame();
+    const auto st2 = std::chrono::steady_clock::now();
     const std::optional<XrSpaceLocation> headLocation = VRManager::instance().XR->UpdateSpaces(m_frameState.predictedDisplayTime);
     VRManager::instance().XR->UpdateSeatedHeightCalibration(m_frameState.predictedDisplayTime, headLocation);
+    if (s_startStats) {
+        const auto st3 = std::chrono::steady_clock::now();
+        static double s_begin = 0, s_vk2 = 0, s_spaces = 0;
+        static uint32_t s_n = 0, s_skippedAtWindow = 0;
+        static auto s_window = st3;
+        s_begin += std::chrono::duration<double, std::milli>(st1 - st0).count();
+        s_vk2 += std::chrono::duration<double, std::milli>(st2 - st1).count();
+        s_spaces += std::chrono::duration<double, std::milli>(st3 - st2).count();
+        ++s_n;
+        if (std::chrono::duration<double, std::milli>(st3 - s_window).count() >= 5000.0) {
+            Log::print<INFO>("[StartFrameStats] frames={} xrBeginFrame={:.2f}ms vk2Start={:.2f}ms updateSpaces={:.2f}ms slotWait={:.2f}ms skippedXr+={} period={:.2f}ms", s_n, s_begin / s_n, s_vk2 / s_n, s_spaces / s_n, m_lastWaitTimeMs, m_skippedXrFrameCount - s_skippedAtWindow, m_predictedDisplayPeriodMs);
+            s_begin = s_vk2 = s_spaces = 0;
+            s_n = 0;
+            s_skippedAtWindow = m_skippedXrFrameCount;
+            s_window = st3;
+        }
+    }
     m_frameViewsPending = true;
     m_frameViewLatchFailed = false;
     m_frameInputLatched = false;

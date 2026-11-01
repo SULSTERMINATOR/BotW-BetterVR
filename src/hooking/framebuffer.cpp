@@ -583,15 +583,40 @@ VkResult VkDeviceOverrides::QueueSubmit(const vkroots::VkQueueDispatch& pDispatc
 VkResult VkDeviceOverrides::QueuePresentKHR(const vkroots::VkQueueDispatch& pDispatch, VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     VRManager::instance().XR->ProcessEvents();
 
+    // BETTERVR_PRESENT_STATS=1: log how long EndFrame, StartFrame and the window present block, averaged over 5 s
+    static const bool s_presentStats = [] { const char* e = getenv("BETTERVR_PRESENT_STATS"); return e && e[0] == '1'; }();
+    using clk = std::chrono::steady_clock;
+    static double s_endMs = 0, s_startMs = 0, s_presentMs = 0;
+    static uint32_t s_n = 0;
+    static clk::time_point s_windowStart = clk::now();
+    const auto t0 = clk::now();
+    auto t1 = t0;
+
     auto* renderer = VRManager::instance().XR->GetRenderer();
     if (renderer && renderer->m_layer3D && renderer->m_layer2D && renderer->m_imguiOverlay) {
         if (renderer->IsInitialized()) {
             renderer->EndFrame();
         }
+        t1 = clk::now();
         renderer->StartFrame();
     }
 
+    const auto t2 = clk::now();
     VkResult result = pDispatch.QueuePresentKHR(queue, pPresentInfo);
+    if (s_presentStats) {
+        const auto t3 = clk::now();
+        s_endMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        s_startMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        s_presentMs += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        ++s_n;
+        const double windowMs = std::chrono::duration<double, std::milli>(t3 - s_windowStart).count();
+        if (windowMs >= 5000.0) {
+            Log::print<INFO>("[PresentStats] presents={} wall/present={:.2f}ms endFrame={:.2f}ms startFrame={:.2f}ms windowPresent={:.2f}ms", s_n, windowMs / s_n, s_endMs / s_n, s_startMs / s_n, s_presentMs / s_n);
+            s_endMs = s_startMs = s_presentMs = 0;
+            s_n = 0;
+            s_windowStart = t3;
+        }
+    }
     if (result == VK_ERROR_DEVICE_LOST) {
         Log::print<ERROR>("QueuePresentKHR failed with error {}", result);
         LogDeviceFaultInfo();
