@@ -78,6 +78,7 @@ public:
         osLib_registerHLEFunction("coreinit", "hook_GetRenderCamera", &hook_GetRenderCamera);
         osLib_registerHLEFunction("coreinit", "hook_GetRenderProjection", &hook_GetRenderProjection);
         osLib_registerHLEFunction("coreinit", "hook_EndCameraSide", &hook_EndCameraSide);
+        osLib_registerHLEFunction("coreinit", "hook_IsMonoRender", &hook_IsMonoRender);
         osLib_registerHLEFunction("coreinit", "hook_RouteActorJob", &hook_RouteActorJob);
 
         osLib_registerHLEFunction("coreinit", "hook_UseCameraDistance", &hook_UseCameraDistance);
@@ -302,6 +303,24 @@ private:
     static std::pair<glm::vec3, glm::fquat> CalculateVRWorldPose(const BESeadLookAtCamera& camera, uint8_t side);
 
     static void hook_UpdateSettings(PPCInterpreter_t* hCPU);
+
+    // BETTERVR_LINUX_MONO=1: during gameplay the stereo patch skips the right eye's calcDraw and procDraw.
+    // r3=0 at frame start: decides this frame, returns 1 if the previous frame had no right eye to draw.
+    // r3=4: returns whether this frame is mono. r3=1: returns 1 to skip the right eye's calcDraw.
+    static inline std::atomic_bool s_monoFrame = false;
+    static bool IsMonoFrame() { return s_monoFrame.load(); }
+    static void hook_IsMonoRender(PPCInterpreter_t* hCPU) {
+        hCPU->instructionPointer = hCPU->sprNew.LR;
+        static const bool s_enabled = [] { const char* e = getenv("BETTERVR_LINUX_MONO"); return e && e[0] == '1'; }();
+        if (hCPU->gpr[3] == 0) {
+            const bool previous = s_monoFrame.load();
+            s_monoFrame = s_enabled && !IsShowingMenu();
+            hCPU->gpr[3] = previous ? 1 : 0;
+        }
+        else {
+            hCPU->gpr[3] = s_monoFrame.load() ? 1 : 0;
+        }
+    }
 
     // Actor Hooks
     static void hook_UpdateActorList(PPCInterpreter_t* hCPU);

@@ -133,11 +133,25 @@ bctrl ; bl calculateUIMaybe
 ; FIRST EYE SIDE
 ; ========================================================================
 
+; mono rendering: decides this frame; skip drawing the previous frame's right eye if it had none
+li r3, 0
+bl import.coreinit.hook_IsMonoRender
+cmpwi r3, 0
+bne skipRightEyeProcDraw_mono
+
 lwz r12, 0(r30)
 lwz r0, 0xF4(r12)
 mtctr r0
 mr r3, r30
 bctrl ; sead__GameFrameworkCafe__procDraw
+
+skipRightEyeProcDraw_mono:
+
+; remember whether this frame is mono, for patches that otherwise assume a right eye pass follows the left one
+li r3, 4
+bl import.coreinit.hook_IsMonoRender
+lis r12, monoFrameActive@ha
+stw r3, monoFrameActive@l(r12)
 
 ; doesn't seem to be necessary
 ;bl import.gx2.GX2DrawDone
@@ -196,7 +210,13 @@ bctrl ; sead__GameFrameworkCafe__procDraw
 
 ; this is a replacement for a GX2DrawDone that prevents command buffers from being corrupted
 bl storeLastSubmittedTimeStamp
+; mono frames have no right eye pass that could recycle the left eye's command buffers, so don't wait
+lis r12, monoFrameActive@ha
+lwz r12, monoFrameActive@l(r12)
+cmpwi r12, 0
+bne skipWaitLeftEye_mono
 bl waitForLastSubmittedTimeStamp
+skipWaitLeftEye_mono:
 ;bl import.gx2.GX2DrawDone
 
 ; note: doesn't seem to be necessary
@@ -223,6 +243,11 @@ skipStallDuringLoadingScreens_one:
 li r3, 0
 bl import.coreinit.hook_EndCameraSide
 
+; mono rendering: skip the right eye's calcDraw (and its procDraw at the start of the next frame)
+li r3, 1
+bl import.coreinit.hook_IsMonoRender
+cmpwi r3, 0
+bne skipRightEyeCalcDraw_mono
 
 li r0, 1
 lis r12, currentEyeSide@ha
@@ -235,6 +260,8 @@ lwz r11, 0xFC(r12)
 mtctr r11
 mr r3, r30
 bctrl ; sead__GameFrameworkCafe__calcDraw
+
+skipRightEyeCalcDraw_mono:
 
 lwz r12, 0(r30)
 lwz r0, 0x7C(r12)
@@ -747,7 +774,15 @@ blr
 ; ==================================================================================
 
 
+monoFrameActive:
+.int 0
+
 preventUnrequestingDraw:
+; mono frames have no right eye pass to clear the draw request, so behave like the unmodified game
+lis r3, monoFrameActive@ha
+lwz r3, monoFrameActive@l(r3)
+cmpwi r3, 0
+bne keepRequestDraw
 lis r3, currentEyeSide@ha
 lwz r3, currentEyeSide@l(r3)
 cmpwi r3, 1
