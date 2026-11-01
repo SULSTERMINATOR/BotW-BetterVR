@@ -26,6 +26,8 @@ namespace VRLayer {
 // own vkCreateInstance (as on WiVRn). With BETTERVR_LINUX_EARLY_INIT=1 and this .so in LD_PRELOAD, the OpenXR instance
 // and Device B are created on a helper thread at process start, before Cemu creates its Vulkan instance.
 #include <dlfcn.h>
+#include <unistd.h>
+#include <cstring>
 static std::atomic_bool s_earlyInitStarted = false;
 static std::atomic_bool s_earlyInitDone = false;
 
@@ -56,6 +58,19 @@ static void WaitForEarlyInit() {
     if (!s_earlyInitDone) {
         Log::print<WARNING>("BetterVR early init still running after 30 s; continuing (may hang)");
     }
+}
+
+// Waiting in the layer's CreateInstance happens with the loader lock already held, so it deadlocks if Device B is still
+// being created (seen when launched from Steam, where SteamVR connects slower than over SSH). Wait instead when Cemu's
+// main thread first dlopens libvulkan, before any loader lock exists.
+extern "C" __attribute__((visibility("default"))) void* dlopen(const char* file, int mode) {
+    static auto realDlopen = reinterpret_cast<void* (*)(const char*, int)>(dlsym(RTLD_NEXT, "dlopen"));
+    if (file && s_earlyInitStarted && !s_earlyInitDone && gettid() == getpid() && strstr(file, "libvulkan")) {
+        for (int i = 0; i < 12000 && !s_earlyInitDone; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    return realDlopen(file, mode);
 }
 #endif
 
