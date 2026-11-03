@@ -144,6 +144,7 @@ public:
     bool EnsureFrameViewsLatched() const;
     bool EnsureFrameInputLatched();
     std::optional<XrTime> ComputeInputSampleTime() const;
+    XrTime ComputeAimPoseTime() const;
     bool HasCurrentFrameViewsLatched() const { return !m_frameViewsPending && !m_frameViewLatchFailed && m_currViews.has_value(); }
     bool DidCurrentFrameViewLatchFail() const { return m_frameViewLatchFailed; }
 

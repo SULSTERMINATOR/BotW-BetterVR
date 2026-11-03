@@ -225,7 +225,7 @@ public:
     void CreateActions();
     std::array<XrViewConfigurationView, 2> GetViewConfigurations();
     std::optional<XrSpaceLocation> UpdateSpaces(XrTime predictedDisplayTime);
-    std::optional<InputState> UpdateActions(XrTime predictedFrameTime, glm::fquat controllerRotation, bool inMenu);
+    std::optional<InputState> UpdateActions(XrTime predictedFrameTime, glm::fquat controllerRotation, bool inMenu, XrTime aimPoseTime = 0);
     void UpdateSeatedHeightCalibration(XrTime predictedDisplayTime, const std::optional<XrSpaceLocation>& headLocation);
     void RequestSeatedHeightCalibration(XrTime notBeforeTime = 0);
     std::optional<float> GetCalibratedSeatedEyeHeight() const;

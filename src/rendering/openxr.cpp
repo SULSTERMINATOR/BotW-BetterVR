@@ -520,7 +520,7 @@ void CheckButtonState(bool buttonPressed, ButtonState& buttonState) {
     buttonState.wasDownLastFrame = down;
 }
 
-std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTime, glm::fquat controllerRotation, bool inMenu) {
+std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTime, glm::fquat controllerRotation, bool inMenu, XrTime aimPoseTime) {
     BetterVRProfiler::Scope profile(BetterVRProfiler::Section::XRUpdateActions);
 
     XrActiveActionSet activeActionSet = { (inMenu ? m_menuActionSet : m_gameplayActionSet), XR_NULL_PATH };
@@ -535,7 +535,7 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
     newState.shared.inputTime = predictedFrameTime;
 
     for (EyeSide side : { EyeSide::LEFT, EyeSide::RIGHT }) {
-        auto locatePose = [&](XrAction action, XrSpace handSpace, XrActionStatePose& poseState, XrSpaceLocation& outLocation, XrSpaceVelocity* outVelocity, const char* errorContext) {
+        auto locatePose = [&](XrAction action, XrSpace handSpace, XrActionStatePose& poseState, XrSpaceLocation& outLocation, XrSpaceVelocity* outVelocity, const char* errorContext, XrTime locateTime) {
             XrActionStateGetInfo getPoseInfo = { XR_TYPE_ACTION_STATE_GET_INFO };
             getPoseInfo.action = action;
             getPoseInfo.subactionPath = m_handPaths[side];
@@ -564,7 +564,7 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
                 outVelocity->angularVelocity = { 0.0f, 0.0f, 0.0f };
             }
 
-            checkXRResult(xrLocateSpace(handSpace, m_stageSpace, predictedFrameTime, &spaceLocation), "Failed to get location from controllers!");
+            checkXRResult(xrLocateSpace(handSpace, m_stageSpace, locateTime, &spaceLocation), "Failed to get location from controllers!");
 #ifndef _WIN32
             if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0 || (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0) {
                 outLocation = lastLocation;
@@ -595,7 +595,8 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
             newState.shared.pose[side],
             newState.shared.poseLocation[side],
             &newState.shared.poseVelocity[side],
-            "Failed to get pose of controller!"
+            "Failed to get pose of controller!",
+            predictedFrameTime
         );
 
         locatePose(
@@ -604,7 +605,9 @@ std::optional<OpenXR::InputState> OpenXR::UpdateActions(XrTime predictedFrameTim
             newState.shared.aimPose[side],
             newState.shared.aimPoseLocation[side],
             nullptr,
-            "Failed to get aim pose of controller!"
+            "Failed to get aim pose of controller!",
+            // aim pose (bow) at a short horizon: at low fps the full prediction extrapolates hand jitter into the aim
+            aimPoseTime != 0 ? aimPoseTime : predictedFrameTime
         );
     }
     // update shared actions

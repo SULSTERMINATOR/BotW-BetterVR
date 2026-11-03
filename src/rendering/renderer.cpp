@@ -480,6 +480,16 @@ bool RND_Renderer::EnsureFrameViewsLatched() const {
     return true;
 }
 
+// Aim pose horizon of one 90 Hz refresh past the frame start, instead of the throttled display time (up to ~55 ms out)
+XrTime RND_Renderer::ComputeAimPoseTime() const {
+    if (m_frameState.predictedDisplayTime == 0) {
+        return 0;
+    }
+    const XrTime periodNs = m_frameState.predictedDisplayPeriod > 0 ? (XrTime)m_frameState.predictedDisplayPeriod : DefaultDisplayPeriodNs;
+    const XrTime shortHorizonNs = 11111111;
+    return m_frameState.predictedDisplayTime - std::max<XrTime>(0, periodNs - shortHorizonNs);
+}
+
 std::optional<XrTime> RND_Renderer::ComputeInputSampleTime() const {
     if (m_frameState.predictedDisplayTime == 0) {
         return std::nullopt;
@@ -518,7 +528,7 @@ bool RND_Renderer::EnsureFrameInputLatched() {
     const XrPosef& rightPose = views->at(OpenXR::EyeSide::RIGHT).pose;
     glm::quat middleOrientation = glm::slerp(ToGLM(leftPose.orientation), ToGLM(rightPose.orientation), 0.5f);
 
-    if (!VRManager::instance().XR->UpdateActions(sampleTime.value(), middleOrientation, CemuHooks::IsShowingMenu()).has_value()) {
+    if (!VRManager::instance().XR->UpdateActions(sampleTime.value(), middleOrientation, CemuHooks::IsShowingMenu(), ComputeAimPoseTime()).has_value()) {
         return false;
     }
 
